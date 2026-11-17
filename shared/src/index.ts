@@ -332,6 +332,8 @@ export interface GenerationJobRecord {
   providerId: string | null;
   externalJobId: string | null;
   modelId: string | null;
+  model?: GeneratedModelRecord;
+  inlineGlbBase64?: string;
   uploadedImages: UploadedImageRecord[];
   creditsCharged: number;
   errorCode: string | null;

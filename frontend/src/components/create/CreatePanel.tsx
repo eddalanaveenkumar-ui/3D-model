@@ -37,7 +37,7 @@ const CATEGORY_PROMPT_PRESETS: Record<AssetCategory, string> = {
   furniture: 'Mid-century Nordic lounge armchair with oiled walnut timber frame, curved armrests, charcoal woven boucle cushions, and brushed brass leg ferrules',
   building: 'Modernist architectural courtyard pavilion with cantilevered board-formed concrete roof, warm cedar vertical louvers, floor-to-ceiling glazing, and reflecting pool',
   tree: 'Mature courtyard oak tree with textured gnarled bark trunk, spreading secondary limbs, layered emerald leaf clusters, set in a carved basalt planter',
-  human: 'Futuristic deep-space exploration astronaut in clean symmetrical A-pose, ceramic-white pressure suit, anodized joints, gold-tinted visor, unarmed',
+  human: 'Futuristic deep-space exploration astronaut in clean symmetrical A-pose, ceramic-white pressure suit, anodized joints, and gold-tinted visor',
   animal: 'Stylized red fox standing alert with warm terracotta fur, cream chest ruff, pointed black-tipped ears, and lush white-tipped tail',
   environment: 'Floating alpine island diorama with faceted basalt cliffs, snow-capped mountain peaks, evergreen pine grove, and clear glacial stream',
 };
@@ -601,6 +601,7 @@ export function CreatePanel({
           <JobStatusCard
             job={activeJob}
             onOpenSettings={onOpenSettings}
+            onRetry={onSubmitGenerate}
             onInspectMatchingDemo={onInspectMatchingDemo}
             onExplainError={onExplainError}
           />

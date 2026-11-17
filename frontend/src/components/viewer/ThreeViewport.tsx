@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import type { GeneratedModelRecord } from '@nv3d/shared';
 import { attachAuthHeaders } from '../../lib/api';
+import { cacheModelGlb, getCachedModelGlb } from '../../lib/localGlbCache';
 import { formatCount, formatDimensionMeters } from '../../lib/format';
 
 export interface LiveSceneStats {
@@ -538,42 +539,53 @@ export default function ThreeViewport({
 
     const loadGlb = async () => {
       try {
-        const res = await fetch(model.downloadUrl, {
-          headers: attachAuthHeaders(new Headers()),
-          credentials: 'include',
-          signal: abortCtrl.signal,
-        });
-        if (!res.ok) {
-          throw new Error(`Failed to fetch GLB model (HTTP ${res.status}).`);
-        }
-
-        const total = Number.parseInt(res.headers.get('content-length') || '0', 10);
         let arrayBuffer: ArrayBuffer;
+        const cached = model.isDemo ? null : await getCachedModelGlb(model.id);
 
-        if (res.body && total > 0) {
-          const reader = res.body.getReader();
-          const parts: Uint8Array[] = [];
-          let received = 0;
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-              parts.push(value);
-              received += value.byteLength;
-              if (!cancelled) {
-                setLoadingPct(Math.min(92, Math.round((received / total) * 90)));
+        if (cached) {
+          arrayBuffer = cached;
+          if (!cancelled) setLoadingPct(92);
+        } else {
+          const res = await fetch(model.downloadUrl, {
+            headers: attachAuthHeaders(new Headers()),
+            credentials: 'include',
+            signal: abortCtrl.signal,
+          });
+          if (!res.ok) {
+            throw new Error(`Failed to fetch GLB model (HTTP ${res.status}).`);
+          }
+
+          const total = Number.parseInt(res.headers.get('content-length') || '0', 10);
+
+          if (res.body && total > 0) {
+            const reader = res.body.getReader();
+            const parts: Uint8Array[] = [];
+            let received = 0;
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (value) {
+                parts.push(value);
+                received += value.byteLength;
+                if (!cancelled) {
+                  setLoadingPct(Math.min(92, Math.round((received / total) * 90)));
+                }
               }
             }
+            const combined = new Uint8Array(received);
+            let offset = 0;
+            for (const part of parts) {
+              combined.set(part, offset);
+              offset += part.byteLength;
+            }
+            arrayBuffer = combined.buffer;
+          } else {
+            arrayBuffer = await res.arrayBuffer();
           }
-          const combined = new Uint8Array(received);
-          let offset = 0;
-          for (const part of parts) {
-            combined.set(part, offset);
-            offset += part.byteLength;
+
+          if (!model.isDemo && arrayBuffer.byteLength <= 15 * 1024 * 1024) {
+            void cacheModelGlb(model.id, arrayBuffer);
           }
-          arrayBuffer = combined.buffer;
-        } else {
-          arrayBuffer = await res.arrayBuffer();
         }
 
         if (cancelled) return;

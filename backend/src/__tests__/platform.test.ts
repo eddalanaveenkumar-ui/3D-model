@@ -69,7 +69,8 @@ describe('NV3D Studio — End-to-End Platform Verification Suite', () => {
   let fixtureGlb: Buffer;
 
   // Controllable test upstream behavior flags
-  let nimBehavior: 'ok' | 'http500' = 'ok';
+  let nimBehavior: 'ok' | 'http500' | 'safety503' = 'ok';
+  let trellisTransient503Remaining = 0;
   let providerBehavior: 'ok' | 'fail_job' | 'corrupt_glb' | 'http500' = 'ok';
   let lastNimRequestBody: Record<string, unknown> | null = null;
   let lastProviderImageCount = 0;
@@ -110,6 +111,15 @@ describe('NV3D Studio — End-to-End Platform Verification Suite', () => {
         if (nimBehavior === 'http500') {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'Upstream NIM capacity limit' } }));
+          return;
+        }
+        if (nimBehavior === 'safety503') {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: { message: 'content safety screening is temporarily unavailable' },
+            })
+          );
           return;
         }
         const parsed = JSON.parse(rawBody) as {
@@ -282,6 +292,17 @@ describe('NV3D Studio — End-to-End Platform Verification Suite', () => {
         if (!parsed.prompt && !parsed.image) {
           res.writeHead(422, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ detail: 'Either prompt or image is required' }));
+          return;
+        }
+        if (trellisTransient503Remaining > 0) {
+          trellisTransient503Remaining -= 1;
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ detail: 'content safety screening is temporarily unavailable' }));
+          return;
+        }
+        if (parsed.prompt && /\b(weapons?|firearms?|bombs?|explosives?|unarmed)\b/i.test(parsed.prompt)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ detail: 'Prompt leaked meta-policy trigger keywords' }));
           return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -927,5 +948,37 @@ describe('NV3D Studio — End-to-End Platform Verification Suite', () => {
     const subsequentNoKey = await request(app).get('/api/system/status').expect(200);
     expect(subsequentNoKey.body.status.demoMode).toBe(true);
     expect(subsequentNoKey.body.status.nim.configured).toBe(false);
+  });
+
+  it('12. recovers seamlessly from HTTP 503 "content safety screening is temporarily unavailable"', async () => {
+    process.env.NVIDIA_NIM_ENDPOINT = `${mockBaseUrl}/v1/chat/completions`;
+    process.env.NVIDIA_NIM_3D_ENDPOINT = `${mockBaseUrl}/v1/genai/microsoft/trellis`;
+    const browserKey = 'nvapi-browser-safety503-recovery-key';
+
+    // Simulate persistent 503 on chat content safety screening AND two transient 503s on TRELLIS
+    nimBehavior = 'safety503';
+    trellisTransient503Remaining = 2;
+
+    try {
+      const sub = await request(app)
+        .post('/api/generate/text')
+        .set('X-NV3D-Session', userAToken)
+        .set('X-Nvidia-Api-Key', browserKey)
+        .send({
+          prompt: 'Mid-century walnut armchair with boucle cushions',
+          settings: DEFAULT_GENERATION_SETTINGS,
+        })
+        .expect(202);
+
+      const done = await pollJobUntilTerminal(app, userAToken, sub.body.job.id);
+      expect(done.job.status).toBe('succeeded');
+      expect(done.job.modelId).toBeTruthy();
+      expect(done.job.structuredSpec.orchestrator).toBe('local-deterministic-fallback');
+      expect(done.job.structuredSpec.warnings[0]).toContain('503');
+      expect(trellisTransient503Remaining).toBe(0);
+    } finally {
+      nimBehavior = 'ok';
+      trellisTransient503Remaining = 0;
+    }
   });
 });

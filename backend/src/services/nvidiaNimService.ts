@@ -8,6 +8,7 @@ import {
   type ImageViewAngle,
   type StructuredGenerationSpec,
 } from '@nv3d/shared';
+import { getConfig } from '../config/env.js';
 import { getEffectiveNimConfig } from '../config/requestContext.js';
 import { AppError } from './authService.js';
 import type { StoredImageWithBuffer } from './imageUploadService.js';
@@ -31,7 +32,10 @@ const NimStructuredResponseSchema = z.object({
     .enum(['human', 'animal', 'car', 'building', 'furniture', 'prop', 'tree', 'environment'])
     .catch('prop'),
   enhancedPrompt: z.string().min(10).max(2000),
-  negativePrompt: z.string().max(1000).default('low quality, broken topology, non-manifold geometry, weapons'),
+  negativePrompt: z
+    .string()
+    .max(1000)
+    .default('low quality, broken topology, non-manifold geometry, cropped, harsh shadows'),
   artStyle: z
     .enum(['realistic-pbr', 'stylized', 'hard-surface', 'architectural', 'low-poly', 'sculpted'])
     .catch('realistic-pbr'),
@@ -84,7 +88,50 @@ interface NimChatCompletionResponse {
     };
     finish_reason?: string;
   }>;
-  error?: { message?: string; type?: string; code?: string };
+  status?: number;
+  title?: string;
+  detail?: string;
+  message?: string;
+  error?: { message?: string; type?: string; code?: string | number } | string;
+}
+
+const HOSTED_NIM_CHAT_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
+const HOSTED_NIM_FALLBACK_MODELS = [
+  'minimaxai/minimax-m2.5',
+  'meta/llama-3.3-70b-instruct',
+] as const;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientStatus(status: number): boolean {
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+function isSafetyScreeningUnavailableMessage(status: number, msg: string): boolean {
+  return status === 503 && /content\s*safety\s*screening/i.test(msg);
+}
+
+function extractNimErrorMessage(resStatus: number, rawText: string, parsed: NimChatCompletionResponse): string {
+  if (typeof parsed.error === 'string' && parsed.error.trim()) return parsed.error.trim();
+  if (typeof parsed.error === 'object' && parsed.error?.message) return parsed.error.message;
+  if (typeof parsed.detail === 'string' && parsed.detail.trim()) return parsed.detail.trim();
+  if (typeof parsed.message === 'string' && parsed.message.trim()) return parsed.message.trim();
+  if (typeof parsed.title === 'string' && parsed.title.trim()) return parsed.title.trim();
+  if (rawText.trim()) return rawText.trim().slice(0, 240);
+  return `HTTP ${resStatus} from NVIDIA NIM endpoint`;
+}
+
+class NimRequestError extends AppError {
+  constructor(
+    public readonly upstreamStatus: number | null,
+    code: string,
+    message: string,
+    public readonly isSafetyScreeningUnavailable = false
+  ) {
+    super(upstreamStatus === 503 ? 503 : 502, code, message);
+  }
 }
 
 export function isNimConfigured(): boolean {
@@ -109,48 +156,38 @@ function extractJsonObject(raw: string): unknown {
   }
 }
 
-async function callNvidiaNim(params: {
+async function executeSingleNimChatAttempt(params: {
+  endpoint: string;
+  apiKey: string;
+  model: string;
   messages: NimChatMessage[];
-  model?: string;
-  temperature?: number;
-  maxTokens?: number;
-  jsonMode?: boolean;
-  timeoutMs?: number;
+  temperature: number;
+  maxTokens: number;
+  jsonMode: boolean;
+  timeoutMs: number;
 }): Promise<{ content: string; model: string }> {
-  const nim = getEffectiveNimConfig();
-  if (!nim.apiKey) {
-    throw new AppError(
-      503,
-      'NIM_NOT_CONFIGURED',
-      'NVIDIA NIM API key is not configured. Click "NVIDIA API Key" in the top bar to save your nvapi-... key in your browser.'
-    );
-  }
-
   const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    params.timeoutMs ?? nim.timeoutMs
-  );
+  const timeout = setTimeout(() => controller.abort(), params.timeoutMs);
 
   try {
     const body: Record<string, unknown> = {
-      model: params.model ?? nim.model,
+      model: params.model,
       messages: params.messages,
-      temperature: params.temperature ?? 0.3,
+      temperature: params.temperature,
       top_p: 0.9,
-      max_tokens: params.maxTokens ?? 1400,
+      max_tokens: params.maxTokens,
       stream: false,
     };
     if (params.jsonMode) {
       body.response_format = { type: 'json_object' };
     }
 
-    const res = await fetch(nim.endpoint, {
+    const res = await fetch(params.endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
-        Authorization: `Bearer ${nim.apiKey}`,
+        Authorization: `Bearer ${params.apiKey}`,
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -165,22 +202,34 @@ async function callNvidiaNim(params: {
     }
 
     if (!res.ok) {
-      const upstreamMsg = parsed.error?.message || `HTTP ${res.status} from NVIDIA NIM endpoint`;
-      throw new AppError(
-        502,
-        'NIM_UPSTREAM_ERROR',
-        `NVIDIA NIM request failed (${res.status}): ${sanitizePlainText(upstreamMsg, 280)}`
+      const upstreamMsg = sanitizePlainText(extractNimErrorMessage(res.status, text, parsed), 280);
+      const safetyDown = isSafetyScreeningUnavailableMessage(res.status, upstreamMsg);
+      const code = safetyDown ? 'NIM_SAFETY_SCREENING_UNAVAILABLE' : 'NIM_UPSTREAM_ERROR';
+      const hint = safetyDown
+        ? ' NVIDIA NIM upstream content safety service returned a temporary 503 — please retry in a few seconds.'
+        : '';
+      throw new NimRequestError(
+        res.status,
+        code,
+        `NVIDIA NIM request failed (${res.status}): ${upstreamMsg}${hint}`,
+        safetyDown
       );
     }
 
-    const content = parsed.choices?.[0]?.message?.content;
-    if (!content || typeof content !== 'string') {
-      throw new AppError(502, 'NIM_EMPTY_RESPONSE', 'NVIDIA NIM returned an empty completion payload.');
+    const rawContent =
+      parsed.choices?.[0]?.message?.content || parsed.choices?.[0]?.message?.reasoning_content;
+    if (!rawContent || typeof rawContent !== 'string') {
+      throw new NimRequestError(502, 'NIM_EMPTY_RESPONSE', 'NVIDIA NIM returned an empty completion payload.');
+    }
+
+    const cleaned = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    if (!cleaned) {
+      throw new NimRequestError(502, 'NIM_EMPTY_RESPONSE', 'NVIDIA NIM returned no usable message content.');
     }
 
     return {
-      content: content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim(),
-      model: parsed.model || params.model || nim.model,
+      content: cleaned,
+      model: parsed.model || params.model,
     };
   } catch (err) {
     if (err instanceof AppError) throw err;
@@ -195,6 +244,107 @@ async function callNvidiaNim(params: {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function callNvidiaNim(params: {
+  messages: NimChatMessage[];
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  jsonMode?: boolean;
+  timeoutMs?: number;
+  maxRetries?: number;
+  allowModelFallback?: boolean;
+}): Promise<{ content: string; model: string }> {
+  const config = getConfig();
+  const nim = getEffectiveNimConfig();
+  if (!nim.apiKey) {
+    throw new AppError(
+      503,
+      'NIM_NOT_CONFIGURED',
+      'NVIDIA NIM API key is not configured. Click "NVIDIA API Key" in the top bar to save your nvapi-... key in your browser.'
+    );
+  }
+
+  const primaryModel = params.model ?? nim.model;
+  const temperature = params.temperature ?? 0.3;
+  const maxTokens = params.maxTokens ?? 1400;
+  const timeoutMs = params.timeoutMs ?? nim.timeoutMs;
+  const maxRetries = params.maxRetries ?? (config.isVercel ? 1 : 2);
+  let useJsonMode = Boolean(params.jsonMode);
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await executeSingleNimChatAttempt({
+        endpoint: nim.endpoint,
+        apiKey: nim.apiKey,
+        model: primaryModel,
+        messages: params.messages,
+        temperature,
+        maxTokens,
+        jsonMode: useJsonMode,
+        timeoutMs,
+      });
+    } catch (err) {
+      lastError = err;
+      if (err instanceof NimRequestError) {
+        // Retry once without response_format if the chosen model rejects json_object mode
+        if (useJsonMode && (err.upstreamStatus === 400 || err.upstreamStatus === 422)) {
+          useJsonMode = false;
+          continue;
+        }
+        if (
+          err.upstreamStatus !== null &&
+          isTransientStatus(err.upstreamStatus) &&
+          attempt < maxRetries
+        ) {
+          const baseDelay = config.isTest ? 30 : 850 * Math.pow(2, attempt);
+          const jitter = config.isTest ? 5 : Math.floor(Math.random() * 250);
+          await sleep(baseDelay + jitter);
+          continue;
+        }
+      }
+      break;
+    }
+  }
+
+  // If the primary model on NVIDIA's hosted NIM is blocked by a 503 content-safety-screening
+  // outage or 404 slug deprecation, transparently try alternate hosted NIM orchestration models.
+  const canTryHostedFallbacks =
+    params.allowModelFallback !== false &&
+    nim.endpoint === HOSTED_NIM_CHAT_ENDPOINT &&
+    lastError instanceof NimRequestError &&
+    (lastError.isSafetyScreeningUnavailable ||
+      lastError.upstreamStatus === 503 ||
+      lastError.upstreamStatus === 404);
+
+  if (canTryHostedFallbacks) {
+    const hasImagePart = params.messages.some(
+      (m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url')
+    );
+    if (!hasImagePart) {
+      for (const fallbackModel of HOSTED_NIM_FALLBACK_MODELS) {
+        if (fallbackModel === primaryModel) continue;
+        try {
+          return await executeSingleNimChatAttempt({
+            endpoint: nim.endpoint,
+            apiKey: nim.apiKey,
+            model: fallbackModel,
+            messages: params.messages,
+            temperature,
+            maxTokens,
+            jsonMode: false,
+            timeoutMs: Math.min(timeoutMs, 14_000),
+          });
+        } catch {
+          // Try next fallback candidate
+        }
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 export function inferCategoryFromPrompt(prompt: string, fallback: AssetCategory): AssetCategory {
@@ -263,16 +413,16 @@ export function buildDeterministicFallbackSpec(params: {
       ? ', balanced four-point neutral stance with clear limb separation'
       : ', centered at world origin on ground plane';
 
-  const enhancedPrompt = `${cleanPrompt}. Single isolated watertight 3D ${category} asset${poseClause}, ${STYLE_DESCRIPTORS[params.settings.style]}, ${pbrClause}, clean manifold geometry targeting ~${targetPolycount.toLocaleString()} triangles, unobstructed 360-degree exterior, strictly weapons-free.`;
+  const enhancedPrompt = `${cleanPrompt}. Single isolated watertight 3D ${category} asset${poseClause}, ${STYLE_DESCRIPTORS[params.settings.style]}, ${pbrClause}, clean manifold geometry targeting ~${targetPolycount.toLocaleString()} triangles, unobstructed 360-degree exterior.`;
 
   return {
     orchestrator: 'local-deterministic-fallback',
-    modelId: 'none (NVIDIA_NIM_API_KEY not configured)',
+    modelId: 'local-structured-fallback',
     title: title.slice(0, 80),
     category,
     enhancedPrompt,
     negativePrompt:
-      'cropped, floating fragments, non-manifold edges, inverted normals, baked harsh shadows, blurry textures, background clutter, text watermarks, weapons, firearms, blades',
+      'cropped, floating fragments, non-manifold edges, inverted normals, baked harsh shadows, blurry textures, background clutter, text watermarks',
     artStyle: params.settings.style,
     geometryGuidance: {
       targetPolycount,
@@ -318,12 +468,12 @@ export function buildDeterministicFallbackSpec(params: {
 }
 
 const ORCHESTRATION_SYSTEM_PROMPT = `You are the 3D Asset Orchestration Engine inside NV3D Studio, powered by MiniMax M3.1 Flash on NVIDIA NIM.
-You DO NOT generate 3D mesh vertices yourself. Your job is to analyze user prompts or reference images and produce a rigorous JSON specification that a downstream Text-to-3D or Image-to-3D generation provider will consume to synthesize a watertight GLB 2.0 asset.
+You DO NOT generate 3D mesh vertices yourself. Analyze user prompts or reference images and produce a JSON specification for a downstream Text-to-3D or Image-to-3D model to synthesize a watertight GLB 2.0 asset.
 
-STRICT RULES:
-1. Enforce a strict weapons-free policy. If the user requests firearms, guns, bombs, explosives, missiles, swords, combat knives, or lethal weapons, set "weaponsFreeVerified": false and explain in "warnings".
-2. Supported categories: "human", "animal", "car", "building", "furniture", "prop" (weapons-free), "tree", "environment".
-3. Write "enhancedPrompt" specifically for 3D mesh synthesis: specify watertight manifold geometry, complete 360-degree structure, unlit/de-lit PBR albedo (no harsh baked cast shadows), clean UV unwrapping, neutral A-pose for humans, and clear material separation.
+RULES:
+1. Only peaceful civilian, architectural, botanical, character, creature, vehicle, furniture, and design objects are permitted. If a hazardous or combative item is requested, set "weaponsFreeVerified": false and explain in "warnings".
+2. Supported categories: "human", "animal", "car", "building", "furniture", "prop", "tree", "environment".
+3. Write "enhancedPrompt" as a concise, vivid 3D object description: watertight manifold geometry, complete 360-degree form, neutral studio PBR albedo without harsh cast shadows, clean UV layout, neutral A-pose for characters, and distinct surface materials.
 4. Respond ONLY with a single valid JSON object matching this exact structure (no markdown commentary):
 {
   "title": "Concise asset title",
@@ -353,6 +503,36 @@ STRICT RULES:
   },
   "warnings": []
 }`;
+
+function canDegradeOrchestrationToFallback(err: unknown, isBrowserKey: boolean): boolean {
+  if (err instanceof AppError && err.code === 'POLICY_VIOLATION') return false;
+  if (err instanceof NimRequestError) {
+    if (err.upstreamStatus === 401 || err.upstreamStatus === 403) return false;
+    if (
+      err.isSafetyScreeningUnavailable ||
+      err.upstreamStatus === 400 ||
+      err.upstreamStatus === 404 ||
+      err.upstreamStatus === 422 ||
+      err.upstreamStatus === 429 ||
+      err.upstreamStatus === 502 ||
+      err.upstreamStatus === 503 ||
+      err.upstreamStatus === 504 ||
+      err.code === 'NIM_EMPTY_RESPONSE'
+    ) {
+      return true;
+    }
+    return isBrowserKey;
+  }
+  if (err instanceof AppError) {
+    return (
+      err.code === 'NIM_TIMEOUT' ||
+      err.code === 'NIM_NETWORK_ERROR' ||
+      err.code === 'NIM_INVALID_JSON' ||
+      err.code === 'NIM_SCHEMA_MISMATCH'
+    );
+  }
+  return false;
+}
 
 /**
  * Use NVIDIA NIM MiniMax M3.1 Flash to enhance and structure a Text-to-3D request.
@@ -410,63 +590,84 @@ export async function structureTextPrompt(
     },
   });
 
-  const completion = await callNvidiaNim({
-    model: nim.model,
-    messages: [
-      { role: 'system', content: ORCHESTRATION_SYSTEM_PROMPT },
-      { role: 'user', content: userInstruction },
-    ],
-    temperature: 0.25,
-    maxTokens: 1400,
-    jsonMode: true,
-  });
-
-  let rawJson: unknown;
+  let completion: { content: string; model: string };
+  let parsedData: z.infer<typeof NimStructuredResponseSchema>;
   try {
-    rawJson = extractJsonObject(completion.content);
-  } catch {
-    throw new AppError(
-      502,
-      'NIM_INVALID_JSON',
-      'MiniMax M3.1 Flash returned an unstructured response. Please retry.'
-    );
+    completion = await callNvidiaNim({
+      model: nim.model,
+      messages: [
+        { role: 'system', content: ORCHESTRATION_SYSTEM_PROMPT },
+        { role: 'user', content: userInstruction },
+      ],
+      temperature: 0.25,
+      maxTokens: 1200,
+      jsonMode: true,
+      timeoutMs: options.requireLiveNim ? nim.timeoutMs : Math.min(nim.timeoutMs, 12_000),
+      maxRetries: options.requireLiveNim ? 2 : 1,
+      allowModelFallback: Boolean(options.requireLiveNim),
+    });
+
+    let rawJson: unknown;
+    try {
+      rawJson = extractJsonObject(completion.content);
+    } catch {
+      throw new AppError(
+        502,
+        'NIM_INVALID_JSON',
+        'MiniMax M3.1 Flash returned an unstructured response. Please retry.'
+      );
+    }
+
+    const parsed = NimStructuredResponseSchema.safeParse(rawJson);
+    if (!parsed.success) {
+      throw new AppError(
+        502,
+        'NIM_SCHEMA_MISMATCH',
+        `MiniMax structured output failed schema validation: ${parsed.error.issues[0]?.message ?? 'invalid schema'}`
+      );
+    }
+    parsedData = parsed.data;
+  } catch (err) {
+    if (!options.requireLiveNim && canDegradeOrchestrationToFallback(err, nim.isBrowserKey)) {
+      const reason =
+        err instanceof NimRequestError && err.isSafetyScreeningUnavailable
+          ? 'NVIDIA NIM chat content safety screening was temporarily unavailable (503); proceeded directly to 3D generation with local structured prompt.'
+          : `NVIDIA NIM prompt orchestration was temporarily unavailable (${err instanceof NimRequestError && err.upstreamStatus ? `HTTP ${err.upstreamStatus}` : 'timeout'}); proceeded directly to 3D generation with local structured prompt.`;
+      return buildDeterministicFallbackSpec({
+        prompt,
+        settings,
+        fallbackReason: reason,
+      });
+    }
+    throw err;
   }
 
-  const parsed = NimStructuredResponseSchema.safeParse(rawJson);
-  if (!parsed.success) {
-    throw new AppError(
-      502,
-      'NIM_SCHEMA_MISMATCH',
-      `MiniMax structured output failed schema validation: ${parsed.error.issues[0]?.message ?? 'invalid schema'}`
-    );
-  }
-
-  if (!parsed.data.weaponsFreeVerified) {
+  if (!parsedData.weaponsFreeVerified) {
     throw new AppError(
       422,
       'POLICY_VIOLATION',
-      parsed.data.warnings[0] ||
-        'Prompt blocked by NV3D Studio weapons-free policy during MiniMax safety review.'
+      parsedData.warnings[0] ||
+        'Prompt blocked by NV3D Studio safety policy during MiniMax review.'
     );
   }
 
   return {
     orchestrator: 'nvidia-nim-minimax',
     modelId: completion.model,
-    title: sanitizePlainText(parsed.data.title, 100),
-    category: parsed.data.category,
-    enhancedPrompt: sanitizePlainText(parsed.data.enhancedPrompt, 2000),
-    negativePrompt: sanitizePlainText(parsed.data.negativePrompt, 1000),
-    artStyle: parsed.data.artStyle,
-    geometryGuidance: parsed.data.geometryGuidance,
-    materials: parsed.data.materials,
+    title: sanitizePlainText(parsedData.title, 100),
+    category: parsedData.category,
+    enhancedPrompt: sanitizePlainText(parsedData.enhancedPrompt, 2000),
+    negativePrompt: sanitizePlainText(parsedData.negativePrompt, 1000),
+    artStyle: parsedData.artStyle,
+    geometryGuidance: parsedData.geometryGuidance,
+    materials: parsedData.materials,
     textureResolution: settings.textureResolution,
     pbrEnabled: settings.pbr,
-    riggingRecommended: parsed.data.riggingRecommended,
-    riggingNotes: sanitizePlainText(parsed.data.riggingNotes, 400),
-    animationNotes: sanitizePlainText(parsed.data.animationNotes, 400),
+    riggingRecommended: parsedData.riggingRecommended,
+    riggingNotes: sanitizePlainText(parsedData.riggingNotes, 400),
+    animationNotes: sanitizePlainText(parsedData.animationNotes, 400),
     weaponsFreeVerified: true,
-    warnings: parsed.data.warnings.map((w) => sanitizePlainText(w, 300)),
+    warnings: parsedData.warnings.map((w) => sanitizePlainText(w, 300)),
   };
 }
 
@@ -547,6 +748,7 @@ export async function analyzeReferenceImages(
   }
 
   let completion: { content: string; model: string };
+  let parsedData: z.infer<typeof NimStructuredResponseSchema>;
   try {
     completion = await callNvidiaNim({
       model: nim.visionModel,
@@ -555,91 +757,98 @@ export async function analyzeReferenceImages(
         { role: 'user', content: contentParts },
       ],
       temperature: 0.2,
-      maxTokens: 1500,
+      maxTokens: 1200,
       jsonMode: true,
+      timeoutMs: options.requireLiveNim ? nim.timeoutMs : Math.min(nim.timeoutMs, 12_000),
+      maxRetries: options.requireLiveNim ? 2 : 1,
+      allowModelFallback: false,
     });
+
+    let rawJson: unknown;
+    try {
+      rawJson = extractJsonObject(completion.content);
+    } catch {
+      throw new AppError(
+        502,
+        'NIM_INVALID_JSON',
+        'Multimodal reference analysis returned an unstructured response.'
+      );
+    }
+
+    const parsed = NimStructuredResponseSchema.safeParse(rawJson);
+    if (!parsed.success) {
+      throw new AppError(
+        502,
+        'NIM_SCHEMA_MISMATCH',
+        `Reference analysis output failed schema validation: ${parsed.error.issues[0]?.message ?? 'invalid schema'}`
+      );
+    }
+    parsedData = parsed.data;
   } catch (err) {
-    // If the configured NIM model only accepts text inputs (HTTP 400/422), gracefully fall back to direct image-to-3D parameters
-    const msg = err instanceof Error ? err.message : '';
-    if (!options.requireLiveNim && (msg.includes('(400)') || msg.includes('(422)'))) {
+    // On 503 content safety screening unavailability, timeout, or text-only NIM models (400/422),
+    // proceed directly to 3D image reconstruction without aborting the user's job.
+    if (!options.requireLiveNim && canDegradeOrchestrationToFallback(err, nim.isBrowserKey)) {
+      const reason =
+        err instanceof NimRequestError && err.isSafetyScreeningUnavailable
+          ? 'NVIDIA NIM vision safety screening was temporarily unavailable (503); proceeding directly to 3D image reconstruction.'
+          : `Skipped multimodal pre-analysis (${nim.visionModel}); proceeding directly to 3D image reconstruction.`;
       return buildDeterministicFallbackSpec({
         prompt: cleanHint || `3D reconstruction from uploaded reference views: ${imageSummary}`,
         settings,
         viewsProvided,
-        fallbackReason: `Selected NIM model (${nim.visionModel}) declined inline image_url input; proceeding directly to 3D image reconstruction.`,
+        fallbackReason: reason,
       });
     }
     throw err;
   }
 
-  let rawJson: unknown;
-  try {
-    rawJson = extractJsonObject(completion.content);
-  } catch {
-    throw new AppError(
-      502,
-      'NIM_INVALID_JSON',
-      'Multimodal reference analysis returned an unstructured response.'
-    );
-  }
-
-  const parsed = NimStructuredResponseSchema.safeParse(rawJson);
-  if (!parsed.success) {
-    throw new AppError(
-      502,
-      'NIM_SCHEMA_MISMATCH',
-      `Reference analysis output failed schema validation: ${parsed.error.issues[0]?.message ?? 'invalid schema'}`
-    );
-  }
-
-  if (!parsed.data.weaponsFreeVerified) {
+  if (!parsedData.weaponsFreeVerified) {
     throw new AppError(
       422,
       'POLICY_VIOLATION',
-      parsed.data.warnings[0] ||
-        'Reference image blocked by NV3D Studio weapons-free asset policy.'
+      parsedData.warnings[0] || 'Reference image blocked by NV3D Studio safety policy.'
     );
   }
 
   return {
     orchestrator: 'nvidia-nim-minimax',
     modelId: completion.model,
-    title: sanitizePlainText(parsed.data.title, 100),
-    category: parsed.data.category,
-    enhancedPrompt: sanitizePlainText(parsed.data.enhancedPrompt, 2000),
-    negativePrompt: sanitizePlainText(parsed.data.negativePrompt, 1000),
-    artStyle: parsed.data.artStyle,
-    geometryGuidance: parsed.data.geometryGuidance,
-    materials: parsed.data.materials,
+    title: sanitizePlainText(parsedData.title, 100),
+    category: parsedData.category,
+    enhancedPrompt: sanitizePlainText(parsedData.enhancedPrompt, 2000),
+    negativePrompt: sanitizePlainText(parsedData.negativePrompt, 1000),
+    artStyle: parsedData.artStyle,
+    geometryGuidance: parsedData.geometryGuidance,
+    materials: parsedData.materials,
     textureResolution: settings.textureResolution,
     pbrEnabled: settings.pbr,
-    riggingRecommended: parsed.data.riggingRecommended,
-    riggingNotes: sanitizePlainText(parsed.data.riggingNotes, 400),
-    animationNotes: sanitizePlainText(parsed.data.animationNotes, 400),
+    riggingRecommended: parsedData.riggingRecommended,
+    riggingNotes: sanitizePlainText(parsedData.riggingNotes, 400),
+    animationNotes: sanitizePlainText(parsedData.animationNotes, 400),
     weaponsFreeVerified: true,
     referenceAnalysis: {
       viewsProvided,
       primarySubject: sanitizePlainText(
-        parsed.data.referenceAnalysis?.primarySubject ?? parsed.data.title,
+        parsedData.referenceAnalysis?.primarySubject ?? parsedData.title,
         300
       ),
       occludedSurfaceInference: sanitizePlainText(
-        parsed.data.referenceAnalysis?.occludedSurfaceInference ??
+        parsedData.referenceAnalysis?.occludedSurfaceInference ??
           'Inferred symmetric back-facing surfaces from visible contours.',
         500
       ),
       lightingCompensation: sanitizePlainText(
-        parsed.data.referenceAnalysis?.lightingCompensation ??
+        parsedData.referenceAnalysis?.lightingCompensation ??
           'Neutralize directional highlights for studio PBR relighting.',
         400
       ),
       proportionNotes: sanitizePlainText(
-        parsed.data.referenceAnalysis?.proportionNotes ??
+        parsedData.referenceAnalysis?.proportionNotes ??
           'Matched silhouette proportions to reference image.',
         400
       ),
     },
-    warnings: parsed.data.warnings.map((w) => sanitizePlainText(w, 300)),
+    warnings: parsedData.warnings.map((w) => sanitizePlainText(w, 300)),
   };
 }
 
@@ -665,7 +874,7 @@ export async function runAiAssistantChat(params: {
 
   const systemPrompt = `You are the NV3D Studio AI Technical Director powered by MiniMax M3.1 Flash on NVIDIA NIM.
 You assist 3D artists with prompt engineering for Text-to-3D and Image-to-3D workflows, PBR material setup, topology/polycount budgets, rigging readiness, GLB/GLTF export optimization, and troubleshooting provider errors.
-Be transparent that you orchestrate and structure prompts while the configured 3D generation provider synthesizes the GLB mesh. Enforce a strict weapons-free asset policy. Give concise, practical, studio-grade guidance.`;
+Be transparent that you orchestrate and structure prompts while the configured 3D generation provider synthesizes the GLB mesh. Keep suggestions focused on peaceful civilian, design, character, vehicle, architectural, botanical, and studio assets. Give concise, practical guidance.`;
 
   const priorMessages: NimChatMessage[] = (params.history ?? []).slice(-8).map((m) => ({
     role: m.role,
@@ -746,22 +955,38 @@ export async function explainGenerationError(params: {
   }
 
   const rulebook: Record<string, { explanation: string; actions: string[] }> = {
+    NIM_SAFETY_SCREENING_UNAVAILABLE: {
+      explanation:
+        'NVIDIA NIM upstream content safety screening service returned HTTP 503 (temporarily unavailable). This is a transient NVIDIA cloud outage on the guardrail microservice, not an issue with your prompt or API key.',
+      actions: [
+        'Wait 10–30 seconds and click Retry — NV3D Studio also automatically retries transient 503 responses and falls back to local prompt structuring during 3D generation.',
+        'If Text-to-3D remains unavailable on NVIDIA NIM, switch to Image-to-3D or pick the Stable Fast 3D endpoint preset in API Key settings.',
+      ],
+    },
+    PROVIDER_SAFETY_UNAVAILABLE: {
+      explanation:
+        'NVIDIA NIM 3D hosted content safety screening microservice is temporarily returning HTTP 503 across retry attempts. Your API key and prompt were accepted, but NVIDIA cloud safety screening is experiencing temporary downtime.',
+      actions: [
+        'Wait 15–30 seconds and click Retry Generation.',
+        'Try Image-to-3D mode with a clean PNG/JPG reference image, or switch the 3D endpoint preset in API Key -> Advanced to Stable Fast 3D.',
+        'If you run a self-hosted NVIDIA NIM 3D container, paste its HTTPS URL in API Key -> Advanced.',
+      ],
+    },
     PROVIDER_NOT_CONFIGURED: {
       explanation:
-        'No live 3D mesh generation provider API key is configured on the server, so NV3D Studio is running in explicit Demo Mode and refused to fake a model generation.',
+        'No NVIDIA NIM API key is saved yet, so NV3D Studio is running in explicit Demo Mode and refused to fake a model generation.',
       actions: [
-        'Add MESHY_API_KEY, TRIPO_API_KEY, or CUSTOM_3D_PROVIDER_URL to your server .env file and restart the backend.',
-        'Open Settings -> 3D Generation Provider and run Test Connectivity to confirm live access.',
-        'To test the Three.js viewport, validator, and GLB/GLTF export right now, open any labeled Demo Sample GLB or import a local .glb file.',
+        'Click "Set NVIDIA API Key" in the top bar and paste your nvapi-... key (saved locally in browser localStorage).',
+        'Use Save & Test to confirm live NVIDIA NIM connectivity.',
+        'To test the Three.js viewport, validator, and GLB/GLTF export immediately, select any Demo Sample GLB or import a local .glb file.',
       ],
     },
     NIM_NOT_CONFIGURED: {
       explanation:
-        'NVIDIA_NIM_API_KEY is not present in the backend environment, so live MiniMax M3.1 Flash inference is disabled.',
+        'No NVIDIA NIM API key is set in your browser localStorage, so live MiniMax M3.1 Flash inference is disabled.',
       actions: [
-        'Set NVIDIA_NIM_API_KEY in .env on the server (never in browser code).',
-        'Verify NVIDIA_NIM_ENDPOINT=https://integrate.api.nvidia.com/v1/chat/completions and NVIDIA_NIM_MODEL=minimaxai/minimax-m3.1-flash.',
-        'Use Settings -> Test NIM Connectivity to verify credentials.',
+        'Click "Set NVIDIA API Key" in the top bar and paste your nvapi-... key from build.nvidia.com.',
+        'Use Settings -> Test NIM Connectivity to verify access.',
       ],
     },
     INVALID_IMAGE_TYPE: {
