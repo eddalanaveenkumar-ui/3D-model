@@ -6,9 +6,10 @@ import dotenv from 'dotenv';
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 dotenv.config({ path: path.resolve(process.cwd(), '../.env') });
 
-// Ephemeral per-process fallback secret for non-production environments only.
-// Never hardcoded — generated from CSPRNG at startup if JWT_SECRET is omitted.
+// Ephemeral per-process fallback secret when JWT_SECRET is omitted in dev or initial zero-env preview.
+// Never hardcoded — generated from CSPRNG at startup.
 const ephemeralDevJwtSecret = crypto.randomBytes(48).toString('hex');
+let loggedVercelJwtWarning = false;
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (!raw) return fallback;
@@ -28,6 +29,7 @@ export interface AppConfig {
   nodeEnv: string;
   isProduction: boolean;
   isTest: boolean;
+  isVercel: boolean;
   port: number;
   host: string;
   corsOrigins: string[];
@@ -39,6 +41,7 @@ export interface AppConfig {
   pgliteDataDir: string;
   supabaseUrl: string;
   supabaseServiceRoleKey: string;
+  supabaseStorageBucket: string;
   storageDir: string;
   maxUploadMb: number;
   maxUploadBytes: number;
@@ -83,27 +86,41 @@ export function getConfig(): AppConfig {
   const nodeEnv = (process.env.NODE_ENV || 'development').trim();
   const isProduction = nodeEnv === 'production';
   const isTest = nodeEnv === 'test';
+  const isVercel = Boolean(process.env.VERCEL);
 
   const configuredJwt = (process.env.JWT_SECRET || '').trim();
   if (isProduction && configuredJwt.length < 32) {
-    throw new Error(
-      'SECURITY ERROR: JWT_SECRET environment variable must be set to at least 32 characters in production.'
-    );
+    if (!isVercel) {
+      throw new Error(
+        'SECURITY ERROR: JWT_SECRET environment variable must be set to at least 32 characters in production.'
+      );
+    }
+    if (!loggedVercelJwtWarning) {
+      loggedVercelJwtWarning = true;
+      console.warn(
+        '[NV3D Studio] WARNING: JWT_SECRET is missing or <32 chars on Vercel. Using ephemeral runtime secret; configure JWT_SECRET in Vercel Project Settings for persistent multi-instance sessions.'
+      );
+    }
   }
 
   const repoRoot = path.basename(process.cwd()) === 'backend'
     ? path.resolve(process.cwd(), '..')
     : process.cwd();
 
-  const resolveDataPath = (raw: string | undefined, fallbackRel: string): string => {
+  const resolveDataPath = (raw: string | undefined, fallbackPath: string): string => {
     const val = (raw || '').trim();
-    if (!val) return path.resolve(repoRoot, fallbackRel);
+    if (!val) {
+      return path.isAbsolute(fallbackPath) ? fallbackPath : path.resolve(repoRoot, fallbackPath);
+    }
     if (val === 'memory://') return val;
     return path.isAbsolute(val) ? val : path.resolve(repoRoot, val);
   };
 
-  const maxUploadMb = parsePositiveInt(process.env.MAX_UPLOAD_MB, 15);
-  const maxGlbImportMb = parsePositiveInt(process.env.MAX_GLB_IMPORT_MB, 50);
+  // Vercel Serverless Functions have a read-only /var/task root and a 4.5 MB request body ceiling.
+  const defaultPgliteDir = isVercel ? '/tmp/nv3d/pgdata' : '.data/pgdata';
+  const defaultStorageDir = isVercel ? '/tmp/nv3d/storage' : '.data/storage';
+  const maxUploadMb = parsePositiveInt(process.env.MAX_UPLOAD_MB, isVercel ? 4 : 15);
+  const maxGlbImportMb = parsePositiveInt(process.env.MAX_GLB_IMPORT_MB, isVercel ? 4 : 50);
 
   const corsOrigins = (process.env.CORS_ORIGINS || '')
     .split(',')
@@ -114,18 +131,20 @@ export function getConfig(): AppConfig {
     nodeEnv,
     isProduction,
     isTest,
+    isVercel,
     port: parsePositiveInt(process.env.PORT, 3001),
     host: (process.env.HOST || '0.0.0.0').trim(),
     corsOrigins,
-    jwtSecret: configuredJwt || ephemeralDevJwtSecret,
+    jwtSecret: configuredJwt.length >= 32 ? configuredJwt : configuredJwt || ephemeralDevJwtSecret,
     jwtExpiresInDays: parsePositiveInt(process.env.JWT_EXPIRES_IN_DAYS, 7),
     initialUserCredits: parsePositiveInt(process.env.INITIAL_USER_CREDITS, 250),
     databaseUrl: (process.env.DATABASE_URL || '').trim(),
     databaseSsl: parseBoolean(process.env.DATABASE_SSL, false),
-    pgliteDataDir: resolveDataPath(process.env.PGLITE_DATA_DIR, '.data/pgdata'),
+    pgliteDataDir: resolveDataPath(process.env.PGLITE_DATA_DIR, defaultPgliteDir),
     supabaseUrl: (process.env.SUPABASE_URL || '').trim(),
     supabaseServiceRoleKey: (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim(),
-    storageDir: resolveDataPath(process.env.STORAGE_DIR, '.data/storage'),
+    supabaseStorageBucket: (process.env.SUPABASE_STORAGE_BUCKET || 'nv3d-assets').trim(),
+    storageDir: resolveDataPath(process.env.STORAGE_DIR, defaultStorageDir),
     maxUploadMb,
     maxUploadBytes: maxUploadMb * 1024 * 1024,
     maxGlbImportMb,

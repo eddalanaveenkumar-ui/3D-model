@@ -13,6 +13,7 @@ import type {
 import { getConfig } from '../config/env.js';
 import { getDb } from '../db/client.js';
 import { AppError } from './authService.js';
+import { rematerializeDemoModel } from './demoAssetService.js';
 import { convertGlbToEmbeddedGltf, optimizeGlbBuffer } from './glbOptimizationService.js';
 import {
   deleteStoredFile,
@@ -30,6 +31,7 @@ interface DbModelRow {
   id: string;
   user_id: string | null;
   job_id: string | null;
+  demo_slug: string | null;
   name: string;
   description: string;
   category: AssetCategory;
@@ -153,6 +155,22 @@ export interface PreparedModelDownload {
   validated: boolean;
 }
 
+async function ensureModelBinaryAvailable(row: DbModelRow): Promise<string> {
+  try {
+    await statStoredFile(row.storage_key);
+    return row.storage_key;
+  } catch (err) {
+    if (row.is_demo && row.demo_slug) {
+      const rebuiltKey = await rematerializeDemoModel(row.demo_slug, row.id);
+      if (rebuiltKey) {
+        row.storage_key = rebuiltKey;
+        return rebuiltKey;
+      }
+    }
+    throw err;
+  }
+}
+
 /**
  * Prepare a genuine validated GLB or embedded GLTF download.
  * Never returns fake or broken payloads; verifies on-disk integrity first.
@@ -168,11 +186,13 @@ export async function prepareModelDownload(
     throw new AppError(422, 'MODEL_NOT_VALIDATED', 'Model failed GLB validation and cannot be exported.');
   }
 
+  const storageKey = await ensureModelBinaryAvailable(row);
+
   if (format === 'gltf') {
     if (!row.gltf_export_supported) {
       throw new AppError(400, 'GLTF_EXPORT_UNSUPPORTED', 'Separate GLTF export is not supported for this model.');
     }
-    const rawGlb = await readStoredFile(row.storage_key);
+    const rawGlb = await readStoredFile(storageKey);
     const gltfBuf = await convertGlbToEmbeddedGltf(rawGlb);
     return {
       filename: toSafeDownloadFilename(row.name, 'gltf'),
@@ -186,13 +206,13 @@ export async function prepareModelDownload(
   }
 
   // Verify the real GLB file exists on disk and has positive length
-  const stat = await statStoredFile(row.storage_key);
+  const stat = await statStoredFile(storageKey);
   return {
     filename: toSafeDownloadFilename(row.name, 'glb'),
     contentType: 'model/gltf-binary',
     byteLength: stat.size,
     sha256: row.sha256,
-    storageKey: row.storage_key,
+    storageKey,
     isDemo: Boolean(row.is_demo),
     validated: true,
   };
@@ -203,7 +223,8 @@ export async function revalidateModelForUser(
   userId: string
 ): Promise<GlbValidationReport> {
   const row = await getRawModelAuthorized(modelId, userId);
-  const buffer = await readStoredFile(row.storage_key);
+  const storageKey = await ensureModelBinaryAvailable(row);
+  const buffer = await readStoredFile(storageKey);
   const report = validateGlbBuffer(buffer);
 
   const db = getDb();

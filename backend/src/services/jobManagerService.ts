@@ -317,6 +317,7 @@ async function runAsyncGenerationPipeline(params: {
   settings: GenerationSettings;
   provider: I3DGenerationProvider;
   creditsCharged: number;
+  skipBackgroundPolling?: boolean;
 }): Promise<void> {
   if (activeJobsInFlight.has(params.jobId)) return;
   activeJobsInFlight.add(params.jobId);
@@ -399,6 +400,12 @@ async function runAsyncGenerationPipeline(params: {
         creditsCharged: params.creditsCharged,
         startedAt,
       });
+      return;
+    }
+
+    // On Vercel Serverless Functions, background loops freeze after the HTTP response ends.
+    // Subsequent GET /api/generate/:jobId polls and /api/webhooks/:provider drive completion instead.
+    if (params.skipBackgroundPolling) {
       return;
     }
 
@@ -566,9 +573,25 @@ export async function submitTextGenerationJob(params: {
     [jobId, params.userId, cleanPrompt, JSON.stringify(params.settings), provider.id, creditCost]
   );
 
+  if (getConfig().isVercel) {
+    // Submit to MiniMax + 3D provider before responding so the Lambda never freezes mid-submission.
+    await runAsyncGenerationPipeline({
+      jobId,
+      userId: params.userId,
+      mode: 'text',
+      prompt: cleanPrompt,
+      settings: params.settings,
+      provider,
+      creditsCharged: creditCost,
+      skipBackgroundPolling: true,
+    });
+    const refreshed = await db.query<DbJobRow>('SELECT * FROM generation_jobs WHERE id = $1', [jobId]);
+    return rowToJobRecord(refreshed.rows[0] ?? inserted.rows[0]);
+  }
+
   const record = await rowToJobRecord(inserted.rows[0]);
 
-  // Kick off non-blocking background workflow
+  // Kick off non-blocking background workflow on persistent Node servers
   setImmediate(() => {
     void runAsyncGenerationPipeline({
       jobId,
@@ -688,6 +711,22 @@ export async function submitImageGenerationJob(params: {
   );
   await attachImagesToJob(imageIds, params.userId, jobId);
 
+  if (getConfig().isVercel) {
+    await runAsyncGenerationPipeline({
+      jobId,
+      userId: params.userId,
+      mode: 'image',
+      prompt: cleanPrompt,
+      images: acceptedImages,
+      settings: params.settings,
+      provider,
+      creditsCharged: creditCost,
+      skipBackgroundPolling: true,
+    });
+    const refreshed = await db.query<DbJobRow>('SELECT * FROM generation_jobs WHERE id = $1', [jobId]);
+    return rowToJobRecord(refreshed.rows[0] ?? inserted.rows[0]);
+  }
+
   const record = await rowToJobRecord(inserted.rows[0]);
 
   setImmediate(() => {
@@ -706,6 +745,93 @@ export async function submitImageGenerationJob(params: {
   return record;
 }
 
+/**
+ * Advance a provider-submitted job by a single status check on serverless deployments
+ * where background setImmediate poll loops do not persist between HTTP requests.
+ */
+async function advanceServerlessJobOnce(row: DbJobRow): Promise<DbJobRow> {
+  if (
+    row.status !== 'processing' ||
+    !row.provider_id ||
+    !row.external_job_id ||
+    activeJobsInFlight.has(row.id)
+  ) {
+    return row;
+  }
+
+  const provider = getProviderById(row.provider_id);
+  if (!provider || !provider.isConfigured()) {
+    return row;
+  }
+
+  activeJobsInFlight.add(row.id);
+  const startedAt = new Date(row.created_at).getTime();
+  try {
+    const polled = await provider.getJobStatus(row.external_job_id);
+    if (polled.status === 'succeeded' && polled.glbUrl) {
+      const settings = parseJson<GenerationSettings>(row.settings);
+      const spec = parseJson<StructuredGenerationSpec>(row.structured_spec);
+      if (settings && spec) {
+        await finalizeProviderAsset({
+          jobId: row.id,
+          userId: row.user_id,
+          mode: row.mode,
+          prompt: row.prompt,
+          spec,
+          settings,
+          provider,
+          glbUrl: polled.glbUrl,
+          creditsCharged: Number(row.credits_charged),
+          startedAt,
+        });
+      }
+    } else if (polled.status === 'failed') {
+      await failJobAndRefund({
+        jobId: row.id,
+        userId: row.user_id,
+        mode: row.mode,
+        prompt: row.prompt,
+        providerId: provider.id,
+        creditsCharged: Number(row.credits_charged),
+        errorCode: 'PROVIDER_GENERATION_FAILED',
+        errorMessage:
+          polled.errorMessage || `${provider.displayName} failed to generate the 3D model.`,
+        startedAt,
+      });
+    } else {
+      await updateJobState(row.id, {
+        status: 'processing',
+        progress: Math.max(24, Math.min(86, polled.progress)),
+        stageLabel:
+          polled.stageLabel ||
+          `Generating 3D geometry on ${provider.displayName} (${Math.round(polled.progress)}%)`,
+        externalJobId: polled.externalJobId,
+      });
+    }
+  } catch (err) {
+    const code = err instanceof AppError ? err.code : 'GENERATION_PIPELINE_ERROR';
+    const msg = err instanceof Error ? err.message : 'Unexpected provider status error.';
+    await failJobAndRefund({
+      jobId: row.id,
+      userId: row.user_id,
+      mode: row.mode,
+      prompt: row.prompt,
+      providerId: provider.id,
+      creditsCharged: Number(row.credits_charged),
+      errorCode: code,
+      errorMessage: msg,
+      startedAt,
+    });
+  } finally {
+    activeJobsInFlight.delete(row.id);
+  }
+
+  const refreshed = await getDb().query<DbJobRow>('SELECT * FROM generation_jobs WHERE id = $1', [
+    row.id,
+  ]);
+  return refreshed.rows[0] ?? row;
+}
+
 export async function getJobForUser(jobId: string, userId: string): Promise<GenerationJobRecord> {
   if (!/^[0-9a-fA-F-]{36}$/.test(jobId)) {
     throw new AppError(400, 'INVALID_JOB_ID', 'Invalid job identifier format.');
@@ -715,9 +841,12 @@ export async function getJobForUser(jobId: string, userId: string): Promise<Gene
   if (res.rows.length === 0) {
     throw new AppError(404, 'JOB_NOT_FOUND', 'Generation job not found.');
   }
-  const row = res.rows[0];
+  let row = res.rows[0];
   if (row.user_id !== userId) {
     throw new AppError(403, 'FORBIDDEN', 'You do not have permission to view this generation job.');
+  }
+  if (getConfig().isVercel && row.status === 'processing') {
+    row = await advanceServerlessJobOnce(row);
   }
   return rowToJobRecord(row);
 }

@@ -1044,6 +1044,39 @@ export async function ensureDemoShowcaseModels(): Promise<void> {
 }
 
 /**
+ * Re-materialize a single Demo Sample GLB on demand (used on serverless cold starts
+ * if `/tmp` was evicted between container invocations).
+ */
+export async function rematerializeDemoModel(demoSlug: string, modelId: string): Promise<string | null> {
+  const spec = DEMO_ASSET_SPECS.find((s) => s.slug === demoSlug);
+  if (!spec) return null;
+  const glb = await spec.build();
+  const report = validateGlbBuffer(glb);
+  if (!report.valid) return null;
+  const saved = await saveGlbFile({
+    ownerScope: 'demo-showcase',
+    modelId,
+    buffer: glb,
+  });
+  await getDb().query(
+    `UPDATE generated_models
+     SET storage_key = $1, file_size_bytes = $2, sha256 = $3,
+         validated = $4, validation_report = $5::jsonb, statistics = $6::jsonb
+     WHERE id = $7`,
+    [
+      saved.storageKey,
+      saved.fileSizeBytes,
+      saved.sha256,
+      report.valid,
+      JSON.stringify(report),
+      JSON.stringify(report.statistics),
+      modelId,
+    ]
+  );
+  return saved.storageKey;
+}
+
+/**
  * Helper exported for automated test suites to produce a genuine, minimal valid PBR GLB binary.
  */
 export async function buildTestFixtureGlb(): Promise<Buffer> {

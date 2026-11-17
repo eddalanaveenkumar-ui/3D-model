@@ -24,13 +24,13 @@ class PostgresPoolDriver implements DbDriver {
   readonly engine = 'postgresql' as const;
   private pool: pg.Pool;
 
-  constructor(connectionString: string, useSsl: boolean) {
+  constructor(connectionString: string, useSsl: boolean, isServerless = false) {
     const isSupabase = connectionString.includes('supabase.co') || connectionString.includes('supabase.com');
     this.pool = new Pool({
       connectionString,
       ssl: useSsl || isSupabase ? { rejectUnauthorized: false } : undefined,
-      max: 12,
-      idleTimeoutMillis: 30_000,
+      max: isServerless ? 3 : 12,
+      idleTimeoutMillis: isServerless ? 15_000 : 30_000,
       connectionTimeoutMillis: 10_000,
     });
   }
@@ -145,7 +145,7 @@ export async function initDatabase(): Promise<DbDriver> {
   initPromise = (async () => {
     const config = getConfig();
     const driver: DbDriver = config.databaseUrl
-      ? new PostgresPoolDriver(config.databaseUrl, config.databaseSsl)
+      ? new PostgresPoolDriver(config.databaseUrl, config.databaseSsl, config.isVercel)
       : new PGliteDriver(config.pgliteDataDir);
 
     const schemaSql = readSchemaSql();

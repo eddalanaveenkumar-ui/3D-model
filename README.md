@@ -148,7 +148,21 @@ npm run start
 
 Serves both the optimized, code-split React + Three.js studio and `/api/*` on `http://0.0.0.0:3001`.
 
-### 6. Run Typecheck & Automated Tests
+### 6. Deploy on Vercel
+
+The repository includes `vercel.json` and the `api/index.js` serverless entrypoint (`backend/src/serverless.ts`):
+
+- Static React + Three.js bundle is served from `frontend/dist` on Vercel's CDN.
+- All `/api/*` endpoints route to `api/index.js` with serverless-safe `/tmp` scratch paths, cold-start Demo Sample GLB auto-recovery, and request-driven + webhook-driven 3D job progression.
+- Configure these server-side Environment Variables in Vercel Project Settings:
+  - `JWT_SECRET` — at least 32 random characters (`openssl rand -hex 32`)
+  - `DATABASE_URL` and `DATABASE_SSL=true` — Supabase (transaction/session pooler) or managed PostgreSQL URL
+  - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_STORAGE_BUCKET=nv3d-assets` — recommended for durable multi-instance storage of generated/imported GLBs and uploaded reference images
+  - `NVIDIA_NIM_API_KEY` (plus `NVIDIA_NIM_MODEL=minimaxai/minimax-m3.1-flash`) — enables live MiniMax M3.1 Flash orchestration
+  - `PROVIDER_3D=auto` and one of `MESHY_API_KEY`, `TRIPO_API_KEY`, or `CUSTOM_3D_PROVIDER_URL` — enables live Text-to-3D and Image-to-3D synthesis
+  - Note: Vercel Serverless Functions enforce a ~4.5 MB request body ceiling, so `MAX_UPLOAD_MB` and `MAX_GLB_IMPORT_MB` default to `4` when `VERCEL` is detected.
+
+### 7. Run Typecheck & Automated Tests
 
 ```bash
 npm run typecheck
