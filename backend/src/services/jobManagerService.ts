@@ -18,7 +18,8 @@ import { AppError, refundUserCredits, reserveUserCredits } from './authService.j
 import { optimizeGlbBuffer } from './glbOptimizationService.js';
 import { recordHistory } from './historyService.js';
 import { attachImagesToJob, type StoredImageWithBuffer } from './imageUploadService.js';
-import { createValidatedGeneratedModel } from './modelService.js';
+import { createValidatedGeneratedModel, getModelForUser } from './modelService.js';
+import { readStoredFile } from './glbStorageService.js';
 import { analyzeReferenceImages, structureTextPrompt } from './nvidiaNimService.js';
 import { checkWeaponsFreePolicy, sanitizePlainText } from './safetyService.js';
 
@@ -491,6 +492,31 @@ async function runAsyncGenerationPipeline(params: {
   }
 }
 
+async function attachInlineServerlessModel(
+  job: GenerationJobRecord,
+  userId: string
+): Promise<GenerationJobRecord> {
+  const cfg = getConfig();
+  if (!cfg.isVercel || cfg.supabaseUrl || job.status !== 'succeeded' || !job.modelId) {
+    return job;
+  }
+  try {
+    const model = await getModelForUser(job.modelId, userId);
+    if (model.fileSizeBytes > 0 && model.fileSizeBytes <= 2_800_000) {
+      const fileKey = `models/${userId.replace(/[^a-zA-Z0-9_-]/g, '')}/${model.id.replace(/[^a-zA-Z0-9_-]/g, '')}.glb`;
+      const glbBuf = await readStoredFile(fileKey);
+      return {
+        ...job,
+        model,
+        inlineGlbBase64: glbBuf.toString('base64'),
+      };
+    }
+    return { ...job, model };
+  } catch {
+    return job;
+  }
+}
+
 /**
  * Create and launch a Text-to-3D generation job.
  * When no 3D provider is configured, honestly records `provider_unconfigured`
@@ -598,7 +624,8 @@ export async function submitTextGenerationJob(params: {
       skipBackgroundPolling: true,
     });
     const refreshed = await db.query<DbJobRow>('SELECT * FROM generation_jobs WHERE id = $1', [jobId]);
-    return rowToJobRecord(refreshed.rows[0] ?? inserted.rows[0]);
+    const job = await rowToJobRecord(refreshed.rows[0] ?? inserted.rows[0]);
+    return attachInlineServerlessModel(job, params.userId);
   }
 
   const record = await rowToJobRecord(inserted.rows[0]);
@@ -739,7 +766,8 @@ export async function submitImageGenerationJob(params: {
       skipBackgroundPolling: true,
     });
     const refreshed = await db.query<DbJobRow>('SELECT * FROM generation_jobs WHERE id = $1', [jobId]);
-    return rowToJobRecord(refreshed.rows[0] ?? inserted.rows[0]);
+    const job = await rowToJobRecord(refreshed.rows[0] ?? inserted.rows[0]);
+    return attachInlineServerlessModel(job, params.userId);
   }
 
   const record = await rowToJobRecord(inserted.rows[0]);

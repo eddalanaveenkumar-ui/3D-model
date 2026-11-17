@@ -21,6 +21,11 @@ import {
   getStoredNimSettings,
   getStoredNvidiaApiKey,
 } from './nimKeyStore';
+import {
+  cacheModelGlb,
+  convertCachedGlbToEmbeddedGltf,
+  getCachedModelGlb,
+} from './localGlbCache';
 
 export class ApiClientError extends Error {
   constructor(
@@ -161,6 +166,35 @@ export async function downloadModelWithProgress(params: {
   });
 
   if (!res.ok) {
+    // Fallback to validated IndexedDB GLB cache if Vercel routed to a cold /tmp instance
+    const cachedGlb = await getCachedModelGlb(params.modelId);
+    if (cachedGlb) {
+      const safeSlug =
+        params.fallbackName
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-|-$/g, '') || 'nv3d-model';
+      const filename = `${safeSlug}.${params.format}`;
+      const blob =
+        params.format === 'gltf'
+          ? convertCachedGlbToEmbeddedGltf(cachedGlb)
+          : new Blob([cachedGlb], { type: 'model/gltf-binary' });
+      params.onProgress?.({ loadedBytes: blob.size, totalBytes: blob.size, percent: 100 });
+      const objectUrl = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement('a');
+        anchor.href = objectUrl;
+        anchor.download = filename;
+        anchor.rel = 'noopener';
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
+      }
+      return { filename, byteLength: blob.size, sha256: null };
+    }
+
     const errData = (await res.json().catch(() => ({}))) as {
       error?: { code?: string; message?: string };
     };
@@ -210,11 +244,15 @@ export async function downloadModelWithProgress(params: {
     throw new ApiClientError(502, 'EMPTY_DOWNLOAD', 'Server returned an empty model binary.');
   }
 
-  // Verify GLB magic bytes client-side when exporting GLB
+  // Verify GLB magic bytes client-side when exporting GLB and refresh client cache
   if (params.format === 'glb') {
-    const header = new DataView(await blob.slice(0, 12).arrayBuffer());
-    if (blob.size < 20 || header.getUint32(0, true) !== 0x46546c67) {
+    const rawBuf = await blob.arrayBuffer();
+    const header = new DataView(rawBuf, 0, Math.min(12, rawBuf.byteLength));
+    if (rawBuf.byteLength < 20 || header.getUint32(0, true) !== 0x46546c67) {
       throw new ApiClientError(422, 'INVALID_GLB_HEADER', 'Downloaded binary failed GLB header verification.');
+    }
+    if (rawBuf.byteLength <= 15 * 1024 * 1024) {
+      void cacheModelGlb(params.modelId, rawBuf);
     }
   }
 

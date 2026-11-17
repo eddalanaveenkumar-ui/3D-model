@@ -7,6 +7,7 @@ import {
   Eye,
   HelpCircle,
   Loader2,
+  RotateCcw,
   Settings,
 } from 'lucide-react';
 import type { AssetCategory, GenerationJobRecord } from '@nv3d/shared';
@@ -14,6 +15,7 @@ import type { AssetCategory, GenerationJobRecord } from '@nv3d/shared';
 interface JobStatusCardProps {
   job: GenerationJobRecord;
   onOpenSettings: () => void;
+  onRetry?: () => void;
   onInspectMatchingDemo: (category: AssetCategory) => void;
   onExplainError: (errorCode: string, errorMessage: string, providerId: string | null) => void;
 }
@@ -21,6 +23,7 @@ interface JobStatusCardProps {
 export function JobStatusCard({
   job,
   onOpenSettings,
+  onRetry,
   onInspectMatchingDemo,
   onExplainError,
 }: JobStatusCardProps) {
@@ -103,16 +106,28 @@ export function JobStatusCard({
           )}
 
           {isFailed && job.errorCode && job.errorMessage && (
-            <button
-              type="button"
-              onClick={() =>
-                onExplainError(job.errorCode!, job.errorMessage!, job.providerId)
-              }
-              className="mt-2 flex items-center gap-1 rounded-md border border-rose-500/35 bg-rose-500/12 px-2.5 py-1 text-[11px] font-medium text-rose-200 transition hover:bg-rose-500/20"
-            >
-              <HelpCircle className="h-3 w-3" />
-              <span>Diagnose Error</span>
-            </button>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {onRetry && (
+                <button
+                  type="button"
+                  onClick={onRetry}
+                  className="flex items-center gap-1 rounded-md border border-[#76b900]/45 bg-[#76b900]/16 px-2.5 py-1 text-[11px] font-medium text-[#d8f3a2] transition hover:bg-[#76b900]/26"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  <span>Retry</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() =>
+                  onExplainError(job.errorCode!, job.errorMessage!, job.providerId)
+                }
+                className="flex items-center gap-1 rounded-md border border-rose-500/35 bg-rose-500/12 px-2.5 py-1 text-[11px] font-medium text-rose-200 transition hover:bg-rose-500/20"
+              >
+                <HelpCircle className="h-3 w-3" />
+                <span>Diagnose Error</span>
+              </button>
+            </div>
           )}
 
           {job.structuredSpec && (

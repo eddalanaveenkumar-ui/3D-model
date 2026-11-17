@@ -30,6 +30,11 @@ import { HomeView } from './components/views/HomeView';
 import { MyModelsView } from './components/views/MyModelsView';
 import { SettingsView } from './components/views/SettingsView';
 import { api, ApiClientError } from './lib/api';
+import {
+  cacheModelGlb,
+  decodeBase64ToArrayBuffer,
+  removeCachedModelGlb,
+} from './lib/localGlbCache';
 import { getStoredNvidiaApiKey, subscribeNimKeyChanges } from './lib/nimKeyStore';
 
 // Lazy-load Three.js + GLTFLoader + OrbitControls in a separate async chunk
@@ -188,16 +193,29 @@ export function App() {
       if (res.job.structuredSpec) {
         setLastSpec(res.job.structuredSpec);
       }
-      // Handle immediate synchronous completion (e.g. NVIDIA NIM 3D on serverless runtime)
+      // Handle immediate synchronous completion (e.g. NVIDIA NIM 3D on Vercel serverless runtime)
       if (res.job.status === 'succeeded' && res.job.modelId) {
-        const [modelRes] = await Promise.all([
-          api.getModel(res.job.modelId),
-          refreshModels(false),
-        ]);
-        setActiveModel(modelRes.model);
+        if (res.job.inlineGlbBase64) {
+          await cacheModelGlb(
+            res.job.modelId,
+            decodeBase64ToArrayBuffer(res.job.inlineGlbBase64)
+          );
+        }
+        let createdModel = res.job.model ?? null;
+        if (!createdModel) {
+          const modelRes = await api.getModel(res.job.modelId);
+          createdModel = modelRes.model;
+        }
+        const fetchedList = await refreshModels(false).catch(() => [] as GeneratedModelRecord[]);
+        if (createdModel && !fetchedList.some((m) => m.id === createdModel!.id)) {
+          setModels((prev) =>
+            prev.some((m) => m.id === createdModel!.id) ? prev : [createdModel!, ...prev]
+          );
+        }
+        setActiveModel(createdModel);
         setLiveStats(null);
         setMobilePane('viewport');
-        showToast(`Loaded "${modelRes.model.name}" into 3D viewport.`);
+        showToast(`Loaded "${createdModel.name}" into 3D viewport.`);
       }
     } catch (err) {
       if (err instanceof ApiClientError) {
@@ -342,7 +360,8 @@ export function App() {
 
   const handleDeleteModel = useCallback(
     async (modelId: string) => {
-      await api.deleteModel(modelId);
+      await api.deleteModel(modelId).catch(() => undefined);
+      await removeCachedModelGlb(modelId);
       const updated = await refreshModels(false);
       if (activeModel?.id === modelId) {
         setActiveModel(updated[0] ?? null);

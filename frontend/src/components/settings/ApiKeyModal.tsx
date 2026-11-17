@@ -41,8 +41,12 @@ const NIM_3D_PRESETS = [
     url: 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis',
   },
   {
-    label: 'Stable Fast 3D (Image)',
+    label: 'Stable Fast 3D',
     url: 'https://ai.api.nvidia.com/v1/genai/stabilityai/stable-fast-3d',
+  },
+  {
+    label: 'SPAR3D',
+    url: 'https://ai.api.nvidia.com/v1/genai/stabilityai/stable-point-aware-3d',
   },
 ] as const;
 
