@@ -269,6 +269,36 @@ describe('NV3D Studio — End-to-End Platform Verification Suite', () => {
         return;
       }
 
+      // --- NVIDIA NIM 3D (microsoft/trellis) contract ---
+      if (req.method === 'POST' && url === '/v1/genai/microsoft/trellis') {
+        const auth = String(req.headers.authorization || '');
+        if (!auth.startsWith('Bearer nvapi-')) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ detail: 'Invalid API key' }));
+          return;
+        }
+        const parsed = JSON.parse(rawBody || '{}') as { prompt?: string; image?: string };
+        // Schema probe from checkConnectivity()
+        if (!parsed.prompt && !parsed.image) {
+          res.writeHead(422, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ detail: 'Either prompt or image is required' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            artifacts: [
+              {
+                base64: fixtureGlb.toString('base64'),
+                finishReason: 'SUCCESS',
+                seed: 0,
+              },
+            ],
+          })
+        );
+        return;
+      }
+
       res.writeHead(404);
       res.end();
     });
@@ -289,7 +319,7 @@ describe('NV3D Studio — End-to-End Platform Verification Suite', () => {
     fs.rmSync(tmpStorage, { recursive: true, force: true });
   });
 
-  it('1. verifies PostgreSQL schema tables, authentication, credits, and XSS sanitization', async () => {
+  it('1. verifies PostgreSQL schema tables, zero-login anonymous workspaces, and disabled sign-up/login', async () => {
     const tables = await listPublicTables();
     expect(tables).toEqual([
       'generated_models',
@@ -300,35 +330,34 @@ describe('NV3D Studio — End-to-End Platform Verification Suite', () => {
       'users',
     ]);
 
-    const regA = await request(app)
+    // Sign-up and login routes are disabled by design (zero-login studio)
+    await request(app)
       .post('/api/auth/register')
-      .send({
-        email: 'alice@nv3d.example',
-        password: 'StrongPassword123!',
-        displayName: 'Alice <script>alert(1)</script> Vance',
-      })
-      .expect(201);
-
-    expect(regA.body.user.email).toBe('alice@nv3d.example');
-    expect(regA.body.user.displayName).not.toContain('<script>');
-    expect(regA.body.user.credits).toBe(250);
-    userAToken = regA.body.token;
-
-    const loginA = await request(app)
+      .send({ email: 'alice@nv3d.example', password: 'StrongPassword123!', displayName: 'Alice' })
+      .expect(404);
+    await request(app)
       .post('/api/auth/login')
       .send({ email: 'alice@nv3d.example', password: 'StrongPassword123!' })
-      .expect(200);
-    expect(loginA.body.user.id).toBe(regA.body.user.id);
+      .expect(404);
 
-    const regB = await request(app)
-      .post('/api/auth/register')
-      .send({
-        email: 'bob@nv3d.example',
-        password: 'AnotherPassword123!',
-        displayName: 'Bob Studio',
-      })
-      .expect(201);
-    userBToken = regB.body.token;
+    // Every visitor automatically gets an isolated zero-login workspace session
+    const sessA = await request(app).get('/api/auth/me').expect(200);
+    expect(sessA.body.user.isGuest).toBe(true);
+    expect(sessA.body.user.credits).toBe(250);
+    userAToken = String(sessA.headers['x-nv3d-session'] || '');
+    expect(userAToken.length).toBeGreaterThan(20);
+
+    // Subsequent request with X-NV3D-Session resolves exact same isolated workspace
+    const sessARepeat = await request(app)
+      .get('/api/auth/me')
+      .set('X-NV3D-Session', userAToken)
+      .expect(200);
+    expect(sessARepeat.body.user.id).toBe(sessA.body.user.id);
+
+    const sessB = await request(app).get('/api/auth/me').expect(200);
+    userBToken = String(sessB.headers['x-nv3d-session'] || '');
+    expect(userBToken.length).toBeGreaterThan(20);
+    expect(sessB.body.user.id).not.toBe(sessA.body.user.id);
   });
 
   it('2. enters honest Demo Mode when no 3D provider or NIM key is configured (never fakes generation)', async () => {
@@ -792,6 +821,7 @@ describe('NV3D Studio — End-to-End Platform Verification Suite', () => {
     // Verify generation endpoint rate limiting triggers HTTP 429
     process.env.GENERATION_RATE_LIMIT_MAX = '2';
     process.env.CUSTOM_3D_PROVIDER_URL = '';
+    process.env.NVIDIA_NIM_API_KEY = '';
     for (let i = 0; i < 2; i++) {
       await request(app)
         .post('/api/generate/text')
@@ -804,5 +834,98 @@ describe('NV3D Studio — End-to-End Platform Verification Suite', () => {
       .send({ prompt: 'Minimalist ceramic vase', settings: DEFAULT_GENERATION_SETTINGS })
       .expect(429);
     expect(limited.body.error.code).toBe('GENERATION_RATE_LIMITED');
+  });
+
+  it('11. supports zero-env browser-localStorage NVIDIA NIM API key (BYOK) for MiniMax + NIM 3D generation', async () => {
+    process.env.GENERATION_RATE_LIMIT_MAX = '40';
+    process.env.NVIDIA_NIM_API_KEY = '';
+    process.env.MESHY_API_KEY = '';
+    process.env.TRIPO_API_KEY = '';
+    process.env.CUSTOM_3D_PROVIDER_URL = '';
+    process.env.NVIDIA_NIM_ENDPOINT = `${mockBaseUrl}/v1/chat/completions`;
+    process.env.NVIDIA_NIM_3D_ENDPOINT = `${mockBaseUrl}/v1/genai/microsoft/trellis`;
+
+    const browserKey = 'nvapi-browser-local-only-key-9876';
+
+    // Without browser header -> remains in honest Demo Mode (strict request isolation)
+    const noKeyStatus = await request(app).get('/api/system/status').expect(200);
+    expect(noKeyStatus.body.status.demoMode).toBe(true);
+    expect(noKeyStatus.body.status.nim.configured).toBe(false);
+    expect(noKeyStatus.body.status.nim.keySource).toBe('none');
+
+    // With X-Nvidia-Api-Key from browser localStorage -> unlocks MiniMax + NVIDIA NIM 3D, never echoes key
+    const withKeyStatus = await request(app)
+      .get('/api/system/status')
+      .set('X-Nvidia-Api-Key', browserKey)
+      .expect(200);
+    expect(withKeyStatus.body.status.demoMode).toBe(false);
+    expect(withKeyStatus.body.status.nim.configured).toBe(true);
+    expect(withKeyStatus.body.status.nim.keySource).toBe('browser-storage');
+    expect(withKeyStatus.body.status.activeProvider.id).toBe('nim-trellis');
+    expect(JSON.stringify(withKeyStatus.body)).not.toContain(browserKey);
+
+    // Connectivity probe succeeds with browser key
+    const provCheck = await request(app)
+      .post('/api/system/test-provider')
+      .set('X-NV3D-Session', userAToken)
+      .set('X-Nvidia-Api-Key', browserKey)
+      .send({ providerId: 'nim-trellis' })
+      .expect(200);
+    expect(provCheck.body.result.reachable).toBe(true);
+
+    // Record credits before BYOK generation (must charge 0 local credits)
+    const creditsBefore = (
+      await request(app).get('/api/auth/credits').set('X-NV3D-Session', userAToken).expect(200)
+    ).body.credits.balance as number;
+
+    // Full Text-to-3D using ONLY the frontend NVIDIA NIM key
+    const sub = await request(app)
+      .post('/api/generate/text')
+      .set('X-NV3D-Session', userAToken)
+      .set('X-Nvidia-Api-Key', browserKey)
+      .send({ prompt: 'Brushed aluminum desk compass', settings: DEFAULT_GENERATION_SETTINGS })
+      .expect(202);
+
+    const done = await pollJobUntilTerminal(app, userAToken, sub.body.job.id);
+    expect(done.job.status).toBe('succeeded');
+    expect(done.job.providerId).toBe('nim-trellis');
+    expect(done.job.modelId).toBeTruthy();
+
+    const dl = await request(app)
+      .get(`/api/models/${done.job.modelId}/download?format=glb`)
+      .set('X-NV3D-Session', userAToken)
+      .buffer(true)
+      .parse((res, cb) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => cb(null, Buffer.concat(chunks)));
+      })
+      .expect(200);
+    expect(validateGlbBuffer(dl.body as Buffer).valid).toBe(true);
+
+    // Full Image-to-3D using ONLY the frontend NVIDIA NIM key
+    const pngImg = await createSampleImage('png', 320, 320);
+    const imgSub = await request(app)
+      .post('/api/generate/image')
+      .set('X-NV3D-Session', userAToken)
+      .set('X-Nvidia-Api-Key', browserKey)
+      .field('prompt', 'Sculpted ceramic planter')
+      .field('settings', JSON.stringify(DEFAULT_GENERATION_SETTINGS))
+      .attach('front', pngImg, { filename: 'front.png', contentType: 'image/png' })
+      .expect(202);
+
+    const imgDone = await pollJobUntilTerminal(app, userAToken, imgSub.body.job.id);
+    expect(imgDone.job.status).toBe('succeeded');
+    expect(imgDone.job.providerId).toBe('nim-trellis');
+
+    // Local credits unchanged (0 charged for user's own API key) and key never persisted in DB
+    const creditsAfter = (
+      await request(app).get('/api/auth/credits').set('X-NV3D-Session', userAToken).expect(200)
+    ).body.credits.balance as number;
+    expect(creditsAfter).toBe(creditsBefore);
+
+    const subsequentNoKey = await request(app).get('/api/system/status').expect(200);
+    expect(subsequentNoKey.body.status.demoMode).toBe(true);
+    expect(subsequentNoKey.body.status.nim.configured).toBe(false);
   });
 });

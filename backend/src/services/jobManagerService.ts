@@ -10,6 +10,7 @@ import {
   type UploadedImageRecord,
 } from '@nv3d/shared';
 import { getConfig } from '../config/env.js';
+import { getEffectiveNimConfig } from '../config/requestContext.js';
 import { getDb } from '../db/client.js';
 import { getActiveProvider, getDemoModeInfo, getProviderById } from '../providers/registry.js';
 import type { I3DGenerationProvider, ProviderWebhookEvent } from '../providers/types.js';
@@ -217,7 +218,8 @@ async function finalizeProviderAsset(params: {
   spec: StructuredGenerationSpec;
   settings: GenerationSettings;
   provider: I3DGenerationProvider;
-  glbUrl: string;
+  glbUrl?: string;
+  glbBuffer?: Buffer;
   creditsCharged: number;
   startedAt: number;
 }): Promise<void> {
@@ -228,13 +230,19 @@ async function finalizeProviderAsset(params: {
   );
   if (statusCheck.rows[0]?.status === 'succeeded') return;
 
-  await updateJobState(params.jobId, {
-    status: 'downloading',
-    stageLabel: `Retrieving GLB from ${params.provider.displayName}`,
-    progress: 88,
-  });
-
-  const rawGlb = await params.provider.downloadGlb(params.glbUrl);
+  let rawGlb: Buffer;
+  if (params.glbBuffer) {
+    rawGlb = params.glbBuffer;
+  } else if (params.glbUrl) {
+    await updateJobState(params.jobId, {
+      status: 'downloading',
+      stageLabel: `Retrieving GLB from ${params.provider.displayName}`,
+      progress: 88,
+    });
+    rawGlb = await params.provider.downloadGlb(params.glbUrl);
+  } else {
+    throw new AppError(502, 'PROVIDER_EMPTY_ASSET', 'Provider did not return a GLB payload.');
+  }
 
   await updateJobState(params.jobId, {
     status: 'optimizing',
@@ -386,8 +394,8 @@ async function runAsyncGenerationPipeline(params: {
       externalJobId: submission.externalJobId,
     });
 
-    // Immediate completion path (if provider returned completed GLB URL synchronously)
-    if (submission.status === 'succeeded' && submission.glbUrl) {
+    // Immediate completion path (e.g. NVIDIA NIM 3D synchronous base64/binary GLB or instant URL)
+    if (submission.status === 'succeeded' && (submission.glbBuffer || submission.glbUrl)) {
       await finalizeProviderAsset({
         jobId: params.jobId,
         userId: params.userId,
@@ -397,6 +405,7 @@ async function runAsyncGenerationPipeline(params: {
         settings: params.settings,
         provider: params.provider,
         glbUrl: submission.glbUrl,
+        glbBuffer: submission.glbBuffer,
         creditsCharged: params.creditsCharged,
         startedAt,
       });
@@ -555,12 +564,15 @@ export async function submitTextGenerationJob(params: {
     });
   }
 
-  const creditCost = calculateGenerationCreditCost(params.settings, 'text');
-  await reserveUserCredits(
-    params.userId,
-    creditCost,
-    `Text-to-3D (${params.settings.quality}, ${params.settings.textureResolution.toUpperCase()})`
-  );
+  const isBrowserByok = getEffectiveNimConfig().isBrowserKey && provider.id === 'nim-trellis';
+  const creditCost = isBrowserByok ? 0 : calculateGenerationCreditCost(params.settings, 'text');
+  if (creditCost > 0) {
+    await reserveUserCredits(
+      params.userId,
+      creditCost,
+      `Text-to-3D (${params.settings.quality}, ${params.settings.textureResolution.toUpperCase()})`
+    );
+  }
 
   const inserted = await db.query<DbJobRow>(
     `INSERT INTO generation_jobs (
@@ -692,12 +704,15 @@ export async function submitImageGenerationJob(params: {
       ? params.images
       : [params.images.find((i) => i.viewAngle === 'front') ?? params.images[0]];
 
-  const creditCost = calculateGenerationCreditCost(params.settings, 'image');
-  await reserveUserCredits(
-    params.userId,
-    creditCost,
-    `Image-to-3D (${acceptedImages.length} view${acceptedImages.length > 1 ? 's' : ''}, ${params.settings.quality})`
-  );
+  const isBrowserByok = getEffectiveNimConfig().isBrowserKey && provider.id === 'nim-trellis';
+  const creditCost = isBrowserByok ? 0 : calculateGenerationCreditCost(params.settings, 'image');
+  if (creditCost > 0) {
+    await reserveUserCredits(
+      params.userId,
+      creditCost,
+      `Image-to-3D (${acceptedImages.length} view${acceptedImages.length > 1 ? 's' : ''}, ${params.settings.quality})`
+    );
+  }
 
   const inserted = await db.query<DbJobRow>(
     `INSERT INTO generation_jobs (

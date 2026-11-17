@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import type { SystemStatus } from '@nv3d/shared';
 import { getConfig } from '../config/env.js';
+import { getEffectiveNimConfig } from '../config/requestContext.js';
 import { getDb, listPublicTables } from '../db/client.js';
 import { ensureStudioUser } from '../middleware/auth.js';
 import {
@@ -14,11 +15,11 @@ import {
 import { checkNimConnectivity, isNimConfigured } from '../services/nvidiaNimService.js';
 
 const SelectProviderSchema = z.object({
-  providerId: z.enum(['meshy', 'tripo', 'custom']).nullable(),
+  providerId: z.enum(['nim-trellis', 'meshy', 'tripo', 'custom']).nullable(),
 });
 
 const TestProviderSchema = z.object({
-  providerId: z.enum(['meshy', 'tripo', 'custom']).optional(),
+  providerId: z.enum(['nim-trellis', 'meshy', 'tripo', 'custom']).optional(),
 });
 
 export function createSystemRouter(): Router {
@@ -28,6 +29,7 @@ export function createSystemRouter(): Router {
   router.get('/status', async (_req, res, next) => {
     try {
       const config = getConfig();
+      const nim = getEffectiveNimConfig();
       const db = getDb();
       const tables = await listPublicTables();
       const providers = listProviderSummaries();
@@ -41,9 +43,11 @@ export function createSystemRouter(): Router {
         demoReason: demo.reason,
         nim: {
           configured: isNimConfigured(),
-          endpoint: config.nim.endpoint,
-          modelId: config.nim.model,
-          visionModelId: config.nim.visionModel,
+          keySource: nim.keySource,
+          endpoint: nim.endpoint,
+          modelId: nim.model,
+          visionModelId: nim.visionModel,
+          nim3dEndpoint: nim.nim3dEndpoint,
         },
         activeProvider: active,
         providers,

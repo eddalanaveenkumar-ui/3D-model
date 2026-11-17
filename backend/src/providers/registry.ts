@@ -3,10 +3,12 @@ import { getConfig } from '../config/env.js';
 import { AppError } from '../services/authService.js';
 import { CustomHttpProviderAdapter } from './customHttpProvider.js';
 import { MeshyProviderAdapter } from './meshyProvider.js';
+import { NvidiaNim3DProviderAdapter } from './nvidiaNim3dProvider.js';
 import { TripoProviderAdapter } from './tripoProvider.js';
 import type { I3DGenerationProvider } from './types.js';
 
 const providers = new Map<ProviderId, I3DGenerationProvider>();
+providers.set('nim-trellis', new NvidiaNim3DProviderAdapter());
 providers.set('meshy', new MeshyProviderAdapter());
 providers.set('tripo', new TripoProviderAdapter());
 providers.set('custom', new CustomHttpProviderAdapter());
@@ -34,7 +36,7 @@ export function setRuntimePreferredProvider(id: ProviderId | null): I3DGeneratio
     throw new AppError(
       400,
       'PROVIDER_NOT_CONFIGURED',
-      `${adapter.displayName} cannot be activated because required environment credentials (${adapter.requiredEnvVars.join(', ')}) are not set.`
+      `${adapter.displayName} cannot be activated because required credentials (${adapter.requiredEnvVars.join(', ')}) are not configured.`
     );
   }
   runtimePreferredProvider = id;
@@ -43,8 +45,10 @@ export function setRuntimePreferredProvider(id: ProviderId | null): I3DGeneratio
 
 /**
  * Resolve the currently active 3D generation provider adapter.
- * Returns `null` when no provider is configured — placing NV3D Studio in
- * transparent Demo Mode (never pretending to generate real AI models).
+ * When a user supplies only their NVIDIA NIM API key (via frontend localStorage
+ * or server env), `nim-trellis` automatically activates. Dedicated 3D provider keys
+ * (`meshy`, `tripo`, `custom`) take precedence if configured.
+ * Returns `null` when no credentials are set — entering honest Demo Mode.
  */
 export function getActiveProvider(): I3DGenerationProvider | null {
   if (runtimePreferredProvider) {
@@ -65,8 +69,8 @@ export function getActiveProvider(): I3DGenerationProvider | null {
     return null;
   }
 
-  // "auto": pick first configured adapter in priority order
-  for (const id of ['meshy', 'tripo', 'custom'] as const) {
+  // "auto": use explicit dedicated 3D adapter if set, otherwise NVIDIA NIM 3D with the user's NIM key
+  for (const id of ['meshy', 'tripo', 'custom', 'nim-trellis'] as const) {
     const adapter = providers.get(id);
     if (adapter?.isConfigured()) {
       return adapter;
@@ -104,13 +108,13 @@ export function getDemoModeInfo(): { demoMode: boolean; reason: string | null } 
     if (adapter) {
       return {
         demoMode: true,
-        reason: `Selected provider "${adapter.displayName}" is missing ${adapter.requiredEnvVars.join(', ')} in server environment variables.`,
+        reason: `Selected provider "${adapter.displayName}" requires ${adapter.requiredEnvVars.join(', ')}.`,
       };
     }
   }
   return {
     demoMode: true,
     reason:
-      'No 3D generation provider credentials are configured (MESHY_API_KEY, TRIPO_API_KEY, or CUSTOM_3D_PROVIDER_URL). Configure a provider in .env to enable live text-to-3D and image-to-3D synthesis, or inspect the built-in Demo Sample GLB assets.',
+      'No NVIDIA NIM API key configured yet. Click "NVIDIA API Key" in the top bar to save your nvapi-... key locally in your browser (no login required), or explore the 8 validated Demo Sample GLB assets.',
   };
 }

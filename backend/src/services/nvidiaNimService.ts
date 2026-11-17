@@ -8,7 +8,7 @@ import {
   type ImageViewAngle,
   type StructuredGenerationSpec,
 } from '@nv3d/shared';
-import { getConfig } from '../config/env.js';
+import { getEffectiveNimConfig } from '../config/requestContext.js';
 import { AppError } from './authService.js';
 import type { StoredImageWithBuffer } from './imageUploadService.js';
 import { checkWeaponsFreePolicy, sanitizePlainText } from './safetyService.js';
@@ -88,7 +88,7 @@ interface NimChatCompletionResponse {
 }
 
 export function isNimConfigured(): boolean {
-  return getConfig().nim.apiKey.length > 0;
+  return getEffectiveNimConfig().apiKey.length > 0;
 }
 
 function extractJsonObject(raw: string): unknown {
@@ -117,24 +117,24 @@ async function callNvidiaNim(params: {
   jsonMode?: boolean;
   timeoutMs?: number;
 }): Promise<{ content: string; model: string }> {
-  const config = getConfig();
-  if (!config.nim.apiKey) {
+  const nim = getEffectiveNimConfig();
+  if (!nim.apiKey) {
     throw new AppError(
       503,
       'NIM_NOT_CONFIGURED',
-      'NVIDIA NIM API key is not configured. Set NVIDIA_NIM_API_KEY in server environment variables to enable MiniMax M3.1 Flash orchestration.'
+      'NVIDIA NIM API key is not configured. Click "NVIDIA API Key" in the top bar to save your nvapi-... key in your browser.'
     );
   }
 
   const controller = new AbortController();
   const timeout = setTimeout(
     () => controller.abort(),
-    params.timeoutMs ?? config.nim.timeoutMs
+    params.timeoutMs ?? nim.timeoutMs
   );
 
   try {
     const body: Record<string, unknown> = {
-      model: params.model ?? config.nim.model,
+      model: params.model ?? nim.model,
       messages: params.messages,
       temperature: params.temperature ?? 0.3,
       top_p: 0.9,
@@ -145,12 +145,12 @@ async function callNvidiaNim(params: {
       body.response_format = { type: 'json_object' };
     }
 
-    const res = await fetch(config.nim.endpoint, {
+    const res = await fetch(nim.endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
-        Authorization: `Bearer ${config.nim.apiKey}`,
+        Authorization: `Bearer ${nim.apiKey}`,
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -167,7 +167,7 @@ async function callNvidiaNim(params: {
     if (!res.ok) {
       const upstreamMsg = parsed.error?.message || `HTTP ${res.status} from NVIDIA NIM endpoint`;
       throw new AppError(
-        res.status === 401 || res.status === 403 ? 502 : 502,
+        502,
         'NIM_UPSTREAM_ERROR',
         `NVIDIA NIM request failed (${res.status}): ${sanitizePlainText(upstreamMsg, 280)}`
       );
@@ -180,7 +180,7 @@ async function callNvidiaNim(params: {
 
     return {
       content: content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim(),
-      model: parsed.model || params.model || config.nim.model,
+      model: parsed.model || params.model || nim.model,
     };
   } catch (err) {
     if (err instanceof AppError) throw err;
@@ -374,20 +374,20 @@ export async function structureTextPrompt(
     throw new AppError(422, 'POLICY_VIOLATION', policy.reason!);
   }
 
-  const config = getConfig();
-  if (!config.nim.apiKey) {
+  const nim = getEffectiveNimConfig();
+  if (!nim.apiKey) {
     if (options.requireLiveNim) {
       throw new AppError(
         503,
         'NIM_NOT_CONFIGURED',
-        'NVIDIA NIM API key (NVIDIA_NIM_API_KEY) is not configured on the server. Add your key in .env to run live MiniMax M3.1 Flash prompt enhancement.'
+        'NVIDIA NIM API key is not configured. Click "NVIDIA API Key" in the top bar to save your nvapi-... key locally in your browser.'
       );
     }
     return buildDeterministicFallbackSpec({
       prompt,
       settings,
       fallbackReason:
-        'NVIDIA_NIM_API_KEY is not configured; using local deterministic prompt structuring instead of live MiniMax M3.1 Flash.',
+        'NVIDIA NIM API key is not set; using local deterministic prompt structuring instead of live MiniMax M3.1 Flash.',
     });
   }
 
@@ -411,7 +411,7 @@ export async function structureTextPrompt(
   });
 
   const completion = await callNvidiaNim({
-    model: config.nim.model,
+    model: nim.model,
     messages: [
       { role: 'system', content: ORCHESTRATION_SYSTEM_PROMPT },
       { role: 'user', content: userInstruction },
@@ -489,25 +489,25 @@ export async function analyzeReferenceImages(
   }
 
   const viewsProvided = images.map((img) => img.viewAngle);
-  const config = getConfig();
+  const nim = getEffectiveNimConfig();
+  const imageSummary = images
+    .map((i) => `${i.viewAngle} (${i.width}x${i.height} ${i.mimeType.replace('image/', '').toUpperCase()})`)
+    .join(', ');
 
-  if (!config.nim.apiKey) {
+  if (!nim.apiKey) {
     if (options.requireLiveNim) {
       throw new AppError(
         503,
         'NIM_NOT_CONFIGURED',
-        'NVIDIA NIM API key (NVIDIA_NIM_API_KEY) is not configured on the server. Configure it in .env to run live multimodal reference image analysis.'
+        'NVIDIA NIM API key is not configured. Click "NVIDIA API Key" in the top bar to save your nvapi-... key locally in your browser.'
       );
     }
-    const imageSummary = images
-      .map((i) => `${i.viewAngle} (${i.width}x${i.height} ${i.mimeType.replace('image/', '').toUpperCase()})`)
-      .join(', ');
     return buildDeterministicFallbackSpec({
       prompt: cleanHint || `3D reconstruction from uploaded reference views: ${imageSummary}`,
       settings,
       viewsProvided,
       fallbackReason:
-        'NVIDIA_NIM_API_KEY is not configured; skipped live multimodal vision analysis and prepared direct image-to-3D parameters.',
+        'NVIDIA NIM API key is not set; skipped live multimodal vision analysis and prepared direct image-to-3D parameters.',
     });
   }
 
@@ -546,16 +546,31 @@ export async function analyzeReferenceImages(
     });
   }
 
-  const completion = await callNvidiaNim({
-    model: config.nim.visionModel,
-    messages: [
-      { role: 'system', content: ORCHESTRATION_SYSTEM_PROMPT },
-      { role: 'user', content: contentParts },
-    ],
-    temperature: 0.2,
-    maxTokens: 1500,
-    jsonMode: true,
-  });
+  let completion: { content: string; model: string };
+  try {
+    completion = await callNvidiaNim({
+      model: nim.visionModel,
+      messages: [
+        { role: 'system', content: ORCHESTRATION_SYSTEM_PROMPT },
+        { role: 'user', content: contentParts },
+      ],
+      temperature: 0.2,
+      maxTokens: 1500,
+      jsonMode: true,
+    });
+  } catch (err) {
+    // If the configured NIM model only accepts text inputs (HTTP 400/422), gracefully fall back to direct image-to-3D parameters
+    const msg = err instanceof Error ? err.message : '';
+    if (!options.requireLiveNim && (msg.includes('(400)') || msg.includes('(422)'))) {
+      return buildDeterministicFallbackSpec({
+        prompt: cleanHint || `3D reconstruction from uploaded reference views: ${imageSummary}`,
+        settings,
+        viewsProvided,
+        fallbackReason: `Selected NIM model (${nim.visionModel}) declined inline image_url input; proceeding directly to 3D image reconstruction.`,
+      });
+    }
+    throw err;
+  }
 
   let rawJson: unknown;
   try {
@@ -794,37 +809,37 @@ export async function explainGenerationError(params: {
  * Verify live connectivity to NVIDIA NIM MiniMax M3.1 Flash without inventing results.
  */
 export async function checkNimConnectivity(): Promise<ConnectivityCheckResult> {
-  const config = getConfig();
+  const nim = getEffectiveNimConfig();
   const checkedAt = new Date().toISOString();
 
-  if (!config.nim.apiKey) {
+  if (!nim.apiKey) {
     return {
       service: 'NVIDIA NIM (MiniMax M3.1 Flash)',
       configured: false,
       reachable: false,
       latencyMs: null,
       statusCode: null,
-      message: 'Not configured. Set NVIDIA_NIM_API_KEY in server environment variables.',
+      message: 'Not configured. Paste your NVIDIA NIM API key (nvapi-...) in API Key settings.',
       checkedAt,
-      endpoint: config.nim.endpoint,
-      modelId: config.nim.model,
+      endpoint: nim.endpoint,
+      modelId: nim.model,
     };
   }
 
   const start = Date.now();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Math.min(config.nim.timeoutMs, 12_000));
+  const timeout = setTimeout(() => controller.abort(), Math.min(nim.timeoutMs, 12_000));
 
   try {
-    const res = await fetch(config.nim.endpoint, {
+    const res = await fetch(nim.endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
-        Authorization: `Bearer ${config.nim.apiKey}`,
+        Authorization: `Bearer ${nim.apiKey}`,
       },
       body: JSON.stringify({
-        model: config.nim.model,
+        model: nim.model,
         messages: [{ role: 'user', content: 'Reply with the single word READY.' }],
         max_tokens: 16,
         temperature: 0,
@@ -840,10 +855,10 @@ export async function checkNimConnectivity(): Promise<ConnectivityCheckResult> {
         reachable: true,
         latencyMs,
         statusCode: res.status,
-        message: `Connected to ${config.nim.model} (${latencyMs} ms).`,
+        message: `Connected to ${nim.model} (${latencyMs} ms).`,
         checkedAt,
-        endpoint: config.nim.endpoint,
-        modelId: config.nim.model,
+        endpoint: nim.endpoint,
+        modelId: nim.model,
       };
     }
 
@@ -856,8 +871,8 @@ export async function checkNimConnectivity(): Promise<ConnectivityCheckResult> {
       statusCode: res.status,
       message: `NVIDIA NIM returned HTTP ${res.status}${errBody ? `: ${sanitizePlainText(errBody, 180)}` : ''}`,
       checkedAt,
-      endpoint: config.nim.endpoint,
-      modelId: config.nim.model,
+      endpoint: nim.endpoint,
+      modelId: nim.model,
     };
   } catch (err) {
     return {
@@ -868,8 +883,8 @@ export async function checkNimConnectivity(): Promise<ConnectivityCheckResult> {
       statusCode: null,
       message: `Connection failed: ${err instanceof Error ? err.message : 'network unreachable'}`,
       checkedAt,
-      endpoint: config.nim.endpoint,
-      modelId: config.nim.model,
+      endpoint: nim.endpoint,
+      modelId: nim.model,
     };
   } finally {
     clearTimeout(timeout);

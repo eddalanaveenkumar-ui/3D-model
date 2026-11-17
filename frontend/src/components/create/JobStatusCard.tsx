@@ -87,7 +87,7 @@ export function JobStatusCard({
                 className="flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-[11px] font-medium text-amber-200 transition hover:bg-amber-500/25"
               >
                 <Settings className="h-3 w-3" />
-                <span>Configure Provider</span>
+                <span>Set NVIDIA API Key</span>
               </button>
               <button
                 type="button"

@@ -6,6 +6,7 @@ import cors from 'cors';
 import express, { type Express } from 'express';
 import helmet from 'helmet';
 import { getConfig } from './config/env.js';
+import { attachClientNimCredentials } from './config/requestContext.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { createApiRateLimiter } from './middleware/rateLimit.js';
 import { createAiRouter } from './routes/aiRoutes.js';
@@ -53,10 +54,22 @@ export function createApp(): Express {
     cors({
       origin: config.corsOrigins.length > 0 ? config.corsOrigins : true,
       credentials: true,
+      allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-NV3D-Session',
+        'X-Nvidia-Api-Key',
+        'X-Nvidia-Nim-Model',
+        'X-Nvidia-3d-Endpoint',
+      ],
+      exposedHeaders: ['X-NV3D-Session', 'X-Content-SHA256', 'Content-Disposition'],
     })
   );
 
   app.use(cookieParser());
+
+  // Scoped per-request NVIDIA NIM API key forwarding (from browser localStorage; never stored or logged)
+  app.use('/api', attachClientNimCredentials);
 
   // Mount raw-body signature-verified webhooks BEFORE express.json()
   app.use('/api/webhooks', createWebhookRouter());

@@ -157,21 +157,23 @@ export function CreatePanel({
 
       {/* Scrollable Controls */}
       <div className="flex-1 space-y-4 overflow-y-auto p-3.5">
-        {/* Explicit Demo Mode Banner */}
+        {/* Explicit Demo Mode / Set NVIDIA API Key Banner */}
         {isDemoMode && (
           <div className="rounded-xl border border-amber-500/30 bg-amber-500/8 px-3 py-2.5 text-[11px] leading-relaxed text-amber-200/90">
             <div className="flex items-center justify-between gap-2">
-              <span className="font-semibold text-amber-300">Demo Mode Active</span>
+              <span className="font-semibold text-amber-300">Add NVIDIA NIM API Key</span>
               <button
                 type="button"
                 onClick={onOpenSettings}
                 className="font-medium text-amber-300 underline decoration-amber-400/50 underline-offset-2 hover:text-white"
               >
-                Setup keys
+                Paste key
               </button>
             </div>
             <p className="mt-0.5 text-[#b9c2d4]">
-              No live 3D provider is configured. Inspect & export real Demo Sample GLBs below, or connect Meshy, Tripo3D, or a Custom adapter in Settings.
+              Paste your <code className="font-mono-tech text-[#dfe5f0]">nvapi-...</code> key (saved
+              in browser localStorage — no login needed) to generate 3D models, or inspect the 8
+              validated Demo Sample GLBs.
             </p>
           </div>
         )}
@@ -634,7 +636,11 @@ export function CreatePanel({
             </span>
           </span>
           <span className="rounded bg-black/15 px-2 py-0.5 font-mono-tech text-[11px]">
-            {isDemoMode ? '0 CR (Demo)' : `${creditCost} CR`}
+            {isDemoMode
+              ? 'Demo'
+              : systemStatus?.nim.keySource === 'browser-storage'
+              ? 'Local Key'
+              : `${creditCost} CR`}
           </span>
         </button>
       </div>

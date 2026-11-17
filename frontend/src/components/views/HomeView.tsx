@@ -109,14 +109,16 @@ export function HomeView({
                     />
                     <span>
                       {systemStatus.demoMode
-                        ? 'Demo Mode (Provider Unconfigured)'
-                        : `${systemStatus.activeProvider?.displayName} Connected`}
+                        ? 'Set NVIDIA NIM API Key'
+                        : `${systemStatus.activeProvider?.displayName} Ready`}
                     </span>
                   </div>
                   <p className="mt-0.5 text-[11px] text-[#7e899f]">
-                    NIM:{' '}
-                    {systemStatus.nim.configured ? 'Configured' : 'Set NVIDIA_NIM_API_KEY'} · DB:{' '}
-                    {systemStatus.database.tables.length} tables active
+                    {systemStatus.nim.configured
+                      ? systemStatus.nim.keySource === 'browser-storage'
+                        ? 'Key saved in browser localStorage · No login required'
+                        : 'NVIDIA NIM active · No login required'
+                      : 'Click to paste nvapi-... key in browser (no sign-up needed)'}
                   </p>
                 </div>
                 <Settings className="h-4 w-4 text-[#838ea4]" />

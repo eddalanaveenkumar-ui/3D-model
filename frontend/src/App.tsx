@@ -16,14 +16,13 @@ import {
   type ImageViewAngle,
   type StructuredGenerationSpec,
   type SystemStatus,
-  type UserProfile,
 } from '@nv3d/shared';
-import { AuthModal } from './components/auth/AuthModal';
 import { CreatePanel } from './components/create/CreatePanel';
 import type { ErrorDiagnosisState } from './components/inspector/AiAssistantPanel';
 import { RightInspector, type InspectorTab } from './components/inspector/RightInspector';
 import { LeftSidebar } from './components/layout/LeftSidebar';
 import { TopNav, type NavSection } from './components/layout/TopNav';
+import { ApiKeyModal } from './components/settings/ApiKeyModal';
 import type { LiveSceneStats } from './components/viewer/ThreeViewport';
 import { ViewportSkeleton } from './components/viewer/ViewportSkeleton';
 import { HistoryView } from './components/views/HistoryView';
@@ -31,6 +30,7 @@ import { HomeView } from './components/views/HomeView';
 import { MyModelsView } from './components/views/MyModelsView';
 import { SettingsView } from './components/views/SettingsView';
 import { api, ApiClientError } from './lib/api';
+import { getStoredNvidiaApiKey, subscribeNimKeyChanges } from './lib/nimKeyStore';
 
 // Lazy-load Three.js + GLTFLoader + OrbitControls in a separate async chunk
 const LazyThreeViewport = lazy(() => import('./components/viewer/ThreeViewport'));
@@ -43,11 +43,11 @@ export function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mobilePane, setMobilePane] = useState<'create' | 'viewport' | 'inspector'>('viewport');
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('inspector');
-  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
+  const [storedNimKey, setStoredNimKey] = useState<string>(() => getStoredNvidiaApiKey());
 
   // Backend state
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
-  const [user, setUser] = useState<UserProfile | null>(null);
   const [models, setModels] = useState<GeneratedModelRecord[]>([]);
   const [activeModel, setActiveModel] = useState<GeneratedModelRecord | null>(null);
   const [liveStats, setLiveStats] = useState<LiveSceneStats | null>(null);
@@ -93,19 +93,20 @@ export function App() {
     return res.models;
   }, []);
 
-  const refreshUser = useCallback(async () => {
-    const res = await api.getMe();
-    setUser(res.user);
+  // Keep browser localStorage NVIDIA NIM key synchronized (including across tabs)
+  useEffect(() => {
+    return subscribeNimKeyChanges(() => {
+      setStoredNimKey(getStoredNvidiaApiKey());
+    });
   }, []);
 
-  // Initial bootstrap (establish session first so requests carry single session cookie)
+  // Initial zero-login bootstrap (provisions an isolated anonymous workspace session automatically)
   useEffect(() => {
     let active = true;
     const init = async () => {
       try {
-        const meRes = await api.getMe();
+        await api.getMe();
         if (!active) return;
-        setUser(meRes.user);
         await Promise.all([refreshSystemStatus(), refreshModels(true)]);
       } catch (err) {
         if (!active) return;
@@ -145,15 +146,12 @@ export function App() {
           const [modelRes] = await Promise.all([
             api.getModel(res.job.modelId),
             refreshModels(false),
-            refreshUser(),
           ]);
           if (cancelled) return;
           setActiveModel(modelRes.model);
           setLiveStats(null);
           setMobilePane('viewport');
           showToast(`Loaded "${modelRes.model.name}" into 3D viewport.`);
-        } else if (res.job.status === 'failed') {
-          await refreshUser();
         }
       } catch {
         // Transient network hiccup; continue polling
@@ -164,7 +162,7 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeJob, refreshModels, refreshUser, showToast]);
+  }, [activeJob, refreshModels, showToast]);
 
   const handleImageFileChange = (angle: ImageViewAngle, file: File | null) => {
     setImageFiles((prev) => {
@@ -187,7 +185,20 @@ export function App() {
           : await api.generateFromImages({ files: imageFiles, prompt, settings });
 
       setActiveJob(res.job);
-      await refreshUser();
+      if (res.job.structuredSpec) {
+        setLastSpec(res.job.structuredSpec);
+      }
+      // Handle immediate synchronous completion (e.g. NVIDIA NIM 3D on serverless runtime)
+      if (res.job.status === 'succeeded' && res.job.modelId) {
+        const [modelRes] = await Promise.all([
+          api.getModel(res.job.modelId),
+          refreshModels(false),
+        ]);
+        setActiveModel(modelRes.model);
+        setLiveStats(null);
+        setMobilePane('viewport');
+        showToast(`Loaded "${modelRes.model.name}" into 3D viewport.`);
+      }
     } catch (err) {
       if (err instanceof ApiClientError) {
         // Structured Demo Mode halt includes the honest job record + prompt spec
@@ -299,7 +310,7 @@ export function App() {
     async (file: File, optimizeSize = false) => {
       try {
         const res = await api.importGlb(file, optimizeSize);
-        await Promise.all([refreshModels(false), refreshUser()]);
+        await refreshModels(false);
         setActiveModel(res.model);
         setLiveStats(null);
         setSection('create');
@@ -316,7 +327,7 @@ export function App() {
         throw err;
       }
     },
-    [refreshModels, refreshUser, showToast]
+    [refreshModels, showToast]
   );
 
   const handleModelValidated = useCallback(
@@ -333,14 +344,13 @@ export function App() {
     async (modelId: string) => {
       await api.deleteModel(modelId);
       const updated = await refreshModels(false);
-      await refreshUser();
       if (activeModel?.id === modelId) {
         setActiveModel(updated[0] ?? null);
         setLiveStats(null);
       }
       showToast('Model deleted from storage.');
     },
-    [activeModel?.id, refreshModels, refreshUser, showToast]
+    [activeModel?.id, refreshModels, showToast]
   );
 
   const handleApplySpec = useCallback((spec: StructuredGenerationSpec) => {
@@ -354,13 +364,13 @@ export function App() {
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-[#0b0d11] text-[#e6eaf2]">
-      {/* Top Navigation */}
+      {/* Top Navigation (No Sign-Up / Login — Direct LocalStorage NVIDIA API Key) */}
       <TopNav
         activeSection={section}
         onNavigate={setSection}
         systemStatus={systemStatus}
-        user={user}
-        onOpenAuth={() => setAuthModalOpen(true)}
+        storedNimKey={storedNimKey}
+        onOpenApiKey={() => setApiKeyModalOpen(true)}
         mobileMenuOpen={mobileMenuOpen}
         onToggleMobileMenu={() => setMobileMenuOpen((o) => !o)}
       />
@@ -433,7 +443,7 @@ export function App() {
                     onEnhancePrompt={() => void handleEnhancePrompt()}
                     onAnalyzeImages={() => void handleAnalyzeImages()}
                     onSubmitGenerate={() => void handleSubmitGenerate()}
-                    onOpenSettings={() => setSection('settings')}
+                    onOpenSettings={() => setApiKeyModalOpen(true)}
                     onInspectMatchingDemo={handleInspectMatchingDemo}
                     onExplainError={(code, msg, prov) => void handleExplainError(code, msg, prov)}
                   />
@@ -486,7 +496,7 @@ export function App() {
                     onModelValidated={(id) => void handleModelValidated(id)}
                     onDeleteModel={(id) => void handleDeleteModel(id)}
                     onApplySpec={handleApplySpec}
-                    onOpenSettings={() => setSection('settings')}
+                    onOpenSettings={() => setApiKeyModalOpen(true)}
                   />
                 </section>
               </div>
@@ -507,7 +517,7 @@ export function App() {
               onImportGlb={(f) => {
                 void handleImportGlb(f, false).catch(() => undefined);
               }}
-              onOpenSettings={() => setSection('settings')}
+              onOpenSettings={() => setApiKeyModalOpen(true)}
             />
           )}
 
@@ -525,7 +535,7 @@ export function App() {
           {section === 'settings' && (
             <SettingsView
               systemStatus={systemStatus}
-              user={user}
+              storedNimKey={storedNimKey}
               onRefreshStatus={refreshSystemStatus}
             />
           )}
@@ -542,15 +552,11 @@ export function App() {
         </main>
       </div>
 
-      {/* Authentication Modal */}
-      <AuthModal
-        open={authModalOpen}
-        user={user}
-        onClose={() => setAuthModalOpen(false)}
-        onUserChange={(nextUser) => {
-          setUser(nextUser);
-          void refreshModels(false);
-        }}
+      {/* Browser LocalStorage NVIDIA NIM API Key Modal */}
+      <ApiKeyModal
+        open={apiKeyModalOpen}
+        onClose={() => setApiKeyModalOpen(false)}
+        onKeyUpdated={refreshSystemStatus}
       />
     </div>
   );

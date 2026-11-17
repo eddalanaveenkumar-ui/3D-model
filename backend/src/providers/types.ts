@@ -37,6 +37,7 @@ export interface ProviderSubmissionResult {
   status: 'queued' | 'processing' | 'succeeded';
   progress: number;
   glbUrl?: string;
+  glbBuffer?: Buffer;
   rawMeta?: Record<string, unknown>;
 }
 
