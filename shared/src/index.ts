@@ -148,7 +148,8 @@ export interface StructuredGenerationSpec {
 
 // --- Provider Types ---
 
-export type ProviderId = 'meshy' | 'tripo' | 'custom';
+export type ProviderId = 'nim-trellis' | 'meshy' | 'tripo' | 'custom';
+export type NimKeySource = 'browser-storage' | 'server-env' | 'none';
 
 export interface ProviderCapabilities {
   textTo3D: boolean;
@@ -191,9 +192,11 @@ export interface SystemStatus {
   demoReason: string | null;
   nim: {
     configured: boolean;
+    keySource?: NimKeySource;
     endpoint: string;
     modelId: string;
     visionModelId: string;
+    nim3dEndpoint?: string;
   };
   activeProvider: ProviderSummary | null;
   providers: ProviderSummary[];

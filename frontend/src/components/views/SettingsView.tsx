@@ -1,50 +1,50 @@
 import { useEffect, useState } from 'react';
 import {
   Activity,
-  Check,
   CheckCircle2,
-  Copy,
   Cpu,
   Database,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  KeyRound,
   Loader2,
+  RotateCcw,
   Server,
   ShieldCheck,
+  Trash2,
   XCircle,
 } from 'lucide-react';
-import type {
-  ConnectivityCheckResult,
-  CreditLedgerEntry,
-  ProviderId,
-  SystemStatus,
-  UserProfile,
-} from '@nv3d/shared';
+import type { ConnectivityCheckResult, ProviderId, SystemStatus } from '@nv3d/shared';
 import { api, ApiClientError } from '../../lib/api';
+import {
+  clearStoredNvidiaApiKey,
+  DEFAULT_NIM_3D_ENDPOINT,
+  DEFAULT_NIM_MODEL_ID,
+  getStoredNimSettings,
+  maskNvidiaApiKey,
+  NVIDIA_API_KEY_STORAGE_KEY,
+  setStoredNimSettings,
+  setStoredNvidiaApiKey,
+} from '../../lib/nimKeyStore';
 
 interface SettingsViewProps {
   systemStatus: SystemStatus | null;
-  user: UserProfile | null;
+  storedNimKey: string;
   onRefreshStatus: () => Promise<void>;
 }
 
-const ENV_SNIPPET = `# Server-side .env configuration (never exposed to browser JS)
-NVIDIA_NIM_ENDPOINT=https://integrate.api.nvidia.com/v1/chat/completions
-NVIDIA_NIM_MODEL=minimaxai/minimax-m3.1-flash
-NVIDIA_NIM_API_KEY=<your-nvidia-nim-api-key>
-
-# Configure one or more replaceable 3D generation providers:
-PROVIDER_3D=auto
-MESHY_API_KEY=<your-meshy-api-key>
-TRIPO_API_KEY=<your-tripo-api-key>
-CUSTOM_3D_PROVIDER_URL=https://your-3d-gateway.example.com
-
-# PostgreSQL / Supabase connection string (uses embedded Postgres 16 if omitted):
-DATABASE_URL=postgresql://postgres:<password>@db.example.com:5432/nv3d_studio`;
-
 export function SettingsView({
   systemStatus,
-  user,
+  storedNimKey,
   onRefreshStatus,
 }: SettingsViewProps) {
+  const [keyInput, setKeyInput] = useState(storedNimKey);
+  const [revealKey, setRevealKey] = useState(false);
+  const [modelId, setModelId] = useState(() => getStoredNimSettings().modelId);
+  const [nim3dEndpoint, setNim3dEndpoint] = useState(() => getStoredNimSettings().nim3dEndpoint);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
+
   const [nimCheck, setNimCheck] = useState<ConnectivityCheckResult | null>(null);
   const [testingNim, setTestingNim] = useState(false);
   const [providerChecks, setProviderChecks] = useState<
@@ -52,25 +52,68 @@ export function SettingsView({
   >({});
   const [testingProvider, setTestingProvider] = useState<ProviderId | null>(null);
   const [switchingProvider, setSwitchingProvider] = useState<ProviderId | null>(null);
-  const [credits, setCredits] = useState<CreditLedgerEntry | null>(null);
-  const [copied, setCopied] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    api
-      .getCredits()
-      .then((r) => setCredits(r.credits))
-      .catch(() => undefined);
-  }, [user?.credits]);
+    setKeyInput(storedNimKey);
+    const s = getStoredNimSettings();
+    setModelId(s.modelId);
+    setNim3dEndpoint(s.nim3dEndpoint);
+  }, [storedNimKey]);
+
+  const handleSaveBrowserKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+    setSaveNotice(null);
+    const cleaned = keyInput.trim();
+    if (cleaned.length < 8 || !/^[\x21-\x7E]+$/.test(cleaned)) {
+      setErrorMsg('Please enter a valid NVIDIA NIM API key (starts with nvapi-..., no spaces).');
+      return;
+    }
+    setStoredNvidiaApiKey(cleaned);
+    setStoredNimSettings({
+      modelId: modelId.trim() || DEFAULT_NIM_MODEL_ID,
+      nim3dEndpoint: nim3dEndpoint.trim() || DEFAULT_NIM_3D_ENDPOINT,
+    });
+    await onRefreshStatus();
+    setSaveNotice(
+      `Saved ${maskNvidiaApiKey(cleaned)} in browser localStorage (${NVIDIA_API_KEY_STORAGE_KEY}).`
+    );
+  };
+
+  const handleClearBrowserKey = async () => {
+    clearStoredNvidiaApiKey();
+    setKeyInput('');
+    setNimCheck(null);
+    setProviderChecks({});
+    setErrorMsg(null);
+    setSaveNotice('Cleared NVIDIA NIM API key from browser localStorage.');
+    await onRefreshStatus();
+  };
+
+  const handleResetEndpoints = async () => {
+    setModelId(DEFAULT_NIM_MODEL_ID);
+    setNim3dEndpoint(DEFAULT_NIM_3D_ENDPOINT);
+    setStoredNimSettings({
+      modelId: DEFAULT_NIM_MODEL_ID,
+      nim3dEndpoint: DEFAULT_NIM_3D_ENDPOINT,
+    });
+    await onRefreshStatus();
+  };
 
   const handleTestNim = async () => {
     setTestingNim(true);
     setErrorMsg(null);
     try {
+      if (keyInput.trim() && keyInput.trim() !== storedNimKey) {
+        setStoredNvidiaApiKey(keyInput.trim());
+        setStoredNimSettings({ modelId, nim3dEndpoint });
+        await onRefreshStatus();
+      }
       const res = await api.testNimConnectivity();
       setNimCheck(res.result);
     } catch (err) {
-      setErrorMsg(err instanceof ApiClientError ? err.message : 'NIM check failed.');
+      setErrorMsg(err instanceof ApiClientError ? err.message : 'NIM connectivity check failed.');
     } finally {
       setTestingNim(false);
     }
@@ -102,20 +145,21 @@ export function SettingsView({
     }
   };
 
-  const handleCopyEnv = async () => {
-    await navigator.clipboard?.writeText(ENV_SNIPPET).catch(() => undefined);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1800);
-  };
+  const keySourceLabel =
+    systemStatus?.nim.keySource === 'browser-storage'
+      ? 'Saved in Browser localStorage'
+      : systemStatus?.nim.keySource === 'server-env'
+      ? 'Server Environment Key'
+      : 'Not Set';
 
   return (
     <div className="h-full overflow-y-auto bg-[#0b0e14]">
       <div className="mx-auto max-w-5xl space-y-6 px-4 py-6 sm:px-8">
         <div>
-          <h1 className="text-xl font-bold text-white">Studio Settings & Pipeline Diagnostics</h1>
+          <h1 className="text-xl font-bold text-white">API Key & Pipeline Diagnostics</h1>
           <p className="mt-0.5 text-xs text-[#8d97ab]">
-            Verify server-side NVIDIA NIM MiniMax M3.1 Flash orchestration, replaceable 3D provider
-            adapters, PostgreSQL persistence, and security policies.
+            Use NV3D Studio directly with no sign-up or login. Paste your NVIDIA NIM API key below
+            to save it in your browser localStorage and unlock MiniMax M3.1 Flash + NVIDIA NIM 3D.
           </p>
         </div>
 
@@ -125,14 +169,14 @@ export function SettingsView({
           </div>
         )}
 
-        {/* 1. NVIDIA NIM Orchestration Model */}
-        <section className="rounded-2xl border border-[#1f2737] bg-[#111520] p-5">
-          <div className="flex flex-wrap items-start justify-between gap-4">
+        {/* 1. Browser LocalStorage NVIDIA NIM API Key Card */}
+        <section className="rounded-2xl border border-[#76b900]/35 bg-[#111520] p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <div className="flex items-center gap-2">
-                <Cpu className="h-4 w-4 text-[#8ed90b]" />
+              <div className="flex flex-wrap items-center gap-2">
+                <KeyRound className="h-4 w-4 text-[#8ed90b]" />
                 <h2 className="text-sm font-semibold text-white">
-                  AI Intelligence & Orchestration — NVIDIA NIM
+                  NVIDIA NIM API Key (Browser Local Storage)
                 </h2>
                 <span
                   className={`rounded px-2 py-0.5 text-[10px] font-semibold uppercase ${
@@ -141,13 +185,140 @@ export function SettingsView({
                       : 'bg-amber-500/12 text-amber-300'
                   }`}
                 >
-                  {systemStatus?.nim.configured ? 'Configured' : 'API Key Not Set'}
+                  {keySourceLabel}
                 </span>
               </div>
               <p className="mt-1.5 text-xs text-[#8d97ab]">
-                Used exclusively on the backend to interpret prompts, analyze reference images, emit
-                structured JSON 3D specifications, and explain errors. API keys are never exposed to
-                browser JavaScript.
+                Only your <code className="font-mono-tech text-[#cfd6e4]">nvapi-...</code> key is
+                needed — no <code className="font-mono-tech text-[#cfd6e4]">.env</code> file, no
+                Meshy/Tripo key, no database setup, and no account login required. Stored only in{' '}
+                <code className="font-mono-tech text-[#cfd6e4]">
+                  localStorage[&quot;{NVIDIA_API_KEY_STORAGE_KEY}&quot;]
+                </code>
+                .
+              </p>
+            </div>
+
+            <a
+              href="https://build.nvidia.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[#2c374e] bg-[#171d2b] px-3 py-1.5 text-xs font-medium text-[#a3e635] transition hover:border-[#8ed90b]"
+            >
+              <span>Get Free Key at build.nvidia.com</span>
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+          </div>
+
+          <form onSubmit={(e) => void handleSaveBrowserKey(e)} className="mt-4 space-y-3.5">
+            <div className="flex flex-col gap-2.5 sm:flex-row">
+              <div className="relative flex-1">
+                <input
+                  type={revealKey ? 'text' : 'password'}
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={keyInput}
+                  onChange={(e) => setKeyInput(e.target.value)}
+                  placeholder="Paste your NVIDIA NIM API key (nvapi-...)"
+                  aria-label="NVIDIA NIM API Key"
+                  className="w-full rounded-xl border border-[#283248] bg-[#0b0e15] py-2.5 pr-10 pl-3.5 font-mono-tech text-xs text-white placeholder-[#5c677d] transition focus:border-[#8ed90b] focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setRevealKey((v) => !v)}
+                  aria-label={revealKey ? 'Hide API key' : 'Show API key'}
+                  className="absolute top-1/2 right-2.5 -translate-y-1/2 rounded-md p-1 text-[#7e899f] transition hover:text-white"
+                >
+                  {revealKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                </button>
+              </div>
+
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="submit"
+                  disabled={!keyInput.trim()}
+                  className="rounded-xl bg-[#76b900] px-4 py-2.5 text-xs font-semibold text-[#080d03] transition hover:bg-[#8ed90b] disabled:opacity-50"
+                >
+                  Save to Browser
+                </button>
+
+                {storedNimKey && (
+                  <button
+                    type="button"
+                    onClick={() => void handleClearBrowserKey()}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-rose-500/35 bg-rose-500/10 px-3 py-2.5 text-xs font-medium text-rose-300 transition hover:bg-rose-500/20"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    <span>Clear</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Editable NIM Model + 3D Endpoint saved in localStorage */}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <label className="mb-1 block text-[10px] font-semibold tracking-wider text-[#7e899f] uppercase">
+                  Orchestration Model (NVIDIA NIM Chat)
+                </label>
+                <input
+                  type="text"
+                  value={modelId}
+                  onChange={(e) => setModelId(e.target.value)}
+                  className="w-full rounded-xl border border-[#1f2839] bg-[#0c1017] px-3 py-2 font-mono-tech text-xs text-[#a3e635] focus:border-[#8ed90b] focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <div className="mb-1 flex items-center justify-between">
+                  <label className="text-[10px] font-semibold tracking-wider text-[#7e899f] uppercase">
+                    3D Mesh Generation Endpoint (NVIDIA NIM 3D)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void handleResetEndpoints()}
+                    className="inline-flex items-center gap-1 text-[10px] text-[#7e899f] hover:text-white"
+                  >
+                    <RotateCcw className="h-2.5 w-2.5" />
+                    <span>Defaults</span>
+                  </button>
+                </div>
+                <input
+                  type="url"
+                  value={nim3dEndpoint}
+                  onChange={(e) => setNim3dEndpoint(e.target.value)}
+                  className="w-full rounded-xl border border-[#1f2839] bg-[#0c1017] px-3 py-2 font-mono-tech text-xs text-[#d8deea] focus:border-[#8ed90b] focus:outline-none"
+                />
+              </div>
+            </div>
+          </form>
+
+          {saveNotice && (
+            <div className="mt-3 flex items-center gap-2 rounded-xl border border-[#76b900]/35 bg-[#76b900]/10 px-3.5 py-2.5 text-xs text-[#d8f3a2]">
+              <CheckCircle2 className="h-4 w-4 shrink-0 text-[#8ed90b]" />
+              <span>{saveNotice}</span>
+            </div>
+          )}
+        </section>
+
+        {/* 2. NVIDIA NIM Orchestration Diagnostics */}
+        <section className="rounded-2xl border border-[#1f2737] bg-[#111520] p-5">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <Cpu className="h-4 w-4 text-[#8ed90b]" />
+                <h2 className="text-sm font-semibold text-white">
+                  AI Intelligence & Orchestration — MiniMax M3.1 Flash
+                </h2>
+              </div>
+              <p className="mt-1.5 text-xs text-[#8d97ab]">
+                Enhances prompts, inspects reference images, produces structured JSON geometry & PBR
+                material instructions, and powers the AI Studio Assistant via{' '}
+                <code className="font-mono-tech text-[#cfd6e4]">
+                  {systemStatus?.nim.endpoint ??
+                    'https://integrate.api.nvidia.com/v1/chat/completions'}
+                </code>
+                .
               </p>
             </div>
 
@@ -164,22 +335,6 @@ export function SettingsView({
               )}
               <span>Test NIM Connectivity</span>
             </button>
-          </div>
-
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            <div className="rounded-xl border border-[#1c2332] bg-[#0c1017] p-3">
-              <span className="text-[10px] tracking-wider text-[#6d788e] uppercase">Endpoint</span>
-              <p className="mt-1 truncate font-mono-tech text-xs text-[#d8deea]">
-                {systemStatus?.nim.endpoint ??
-                  'https://integrate.api.nvidia.com/v1/chat/completions'}
-              </p>
-            </div>
-            <div className="rounded-xl border border-[#1c2332] bg-[#0c1017] p-3">
-              <span className="text-[10px] tracking-wider text-[#6d788e] uppercase">Model ID</span>
-              <p className="mt-1 font-mono-tech text-xs text-[#a3e635]">
-                {systemStatus?.nim.modelId ?? 'minimaxai/minimax-m3.1-flash'}
-              </p>
-            </div>
           </div>
 
           {nimCheck && (
@@ -200,21 +355,21 @@ export function SettingsView({
           )}
         </section>
 
-        {/* 2. Modular Replaceable 3D Generation Providers */}
+        {/* 3. Modular Replaceable 3D Generation Providers */}
         <section className="rounded-2xl border border-[#1f2737] bg-[#111520] p-5">
           <div className="flex items-center gap-2">
             <Server className="h-4 w-4 text-[#8ed90b]" />
             <h2 className="text-sm font-semibold text-white">
-              3D Generation Provider Adapters (Replaceable Backend Layer)
+              3D Generation Provider Adapters
             </h2>
           </div>
           <p className="mt-1 text-xs text-[#8d97ab]">
             {systemStatus?.demoMode
               ? systemStatus.demoReason
-              : `Active live synthesis adapter: ${systemStatus?.activeProvider?.displayName}.`}
+              : `Active live 3D mesh generator: ${systemStatus?.activeProvider?.displayName}.`}
           </p>
 
-          <div className="mt-4 grid gap-3.5 md:grid-cols-3">
+          <div className="mt-4 grid gap-3.5 sm:grid-cols-2">
             {(systemStatus?.providers ?? []).map((p) => {
               const check = providerChecks[p.id];
               return (
@@ -238,54 +393,50 @@ export function SettingsView({
                             : 'bg-[#1b2232] text-[#838ea4]'
                         }`}
                       >
-                        {p.active ? 'Active' : p.configured ? 'Ready' : 'Unconfigured'}
+                        {p.active ? 'Active' : p.configured ? 'Ready' : 'Optional'}
                       </span>
                     </div>
 
                     <p className="mt-1.5 font-mono-tech text-[10px] text-[#78839a]">
-                      Env: {p.requiredEnvVars.join(', ')}
+                      {p.id === 'nim-trellis'
+                        ? 'Uses your browser NVIDIA NIM API key (no extra key needed)'
+                        : `Optional server env: ${p.requiredEnvVars.join(', ')}`}
                     </p>
 
-                    {/* Capabilities */}
                     <div className="mt-3 flex flex-wrap gap-1 text-[10px]">
                       {p.capabilities.textTo3D && (
-                        <span className="rounded bg-[#171d2a] px-1.5 py-0.5 text-[#cfd6e4]">
-                          Text-3D
+                        <span className="rounded bg-[#161c28] px-1.5 py-0.5 text-[#b9c3d6]">
+                          Text-to-3D
                         </span>
                       )}
                       {p.capabilities.imageTo3D && (
-                        <span className="rounded bg-[#171d2a] px-1.5 py-0.5 text-[#cfd6e4]">
-                          Image-3D
+                        <span className="rounded bg-[#161c28] px-1.5 py-0.5 text-[#b9c3d6]">
+                          Image-to-3D
                         </span>
                       )}
                       {p.capabilities.multiViewImageTo3D && (
-                        <span className="rounded bg-[#171d2a] px-1.5 py-0.5 text-[#cfd6e4]">
-                          Front/Side/Back
+                        <span className="rounded bg-[#161c28] px-1.5 py-0.5 text-[#b9c3d6]">
+                          Multi-View
                         </span>
                       )}
                       {p.capabilities.pbrMaterials && (
-                        <span className="rounded bg-[#171d2a] px-1.5 py-0.5 text-[#cfd6e4]">
+                        <span className="rounded bg-[#161c28] px-1.5 py-0.5 text-[#b9c3d6]">
                           PBR {p.capabilities.maxTextureResolution.toUpperCase()}
                         </span>
                       )}
-                      {p.capabilities.rigging && (
-                        <span className="rounded bg-[#76b900]/15 px-1.5 py-0.5 text-[#a3e635]">
-                          Rig + Anim
-                        </span>
-                      )}
-                      {p.capabilities.webhooks && (
-                        <span className="rounded bg-[#171d2a] px-1.5 py-0.5 text-[#9aa4b8]">
-                          HMAC Webhook
+                      {p.capabilities.gltfExport && (
+                        <span className="rounded bg-[#161c28] px-1.5 py-0.5 text-[#b9c3d6]">
+                          GLB + GLTF
                         </span>
                       )}
                     </div>
 
                     {check && (
                       <p
-                        className={`mt-2.5 rounded-lg border p-2 text-[10px] leading-relaxed ${
+                        className={`mt-2.5 rounded-lg border p-2 text-[11px] ${
                           check.reachable
-                            ? 'border-[#76b900]/35 bg-[#76b900]/10 text-[#d8f3a2]'
-                            : 'border-amber-500/30 bg-amber-500/8 text-amber-200'
+                            ? 'border-[#76b900]/30 bg-[#76b900]/10 text-[#d8f3a2]'
+                            : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
                         }`}
                       >
                         {check.message}
@@ -293,24 +444,25 @@ export function SettingsView({
                     )}
                   </div>
 
-                  <div className="mt-4 flex gap-1.5">
+                  <div className="mt-3.5 flex items-center gap-2">
                     <button
                       type="button"
-                      disabled={testingProvider === p.id}
+                      disabled={!p.configured || testingProvider === p.id}
                       onClick={() => void handleTestProvider(p.id)}
-                      className="flex flex-1 items-center justify-center gap-1 rounded-lg border border-[#273146] bg-[#141a26] py-1.5 text-[11px] font-medium text-[#d8deea] transition hover:border-[#8ed90b] hover:text-white disabled:opacity-50"
+                      className="flex flex-1 items-center justify-center gap-1 rounded-lg border border-[#263044] bg-[#141925] py-1.5 text-[11px] font-medium text-[#d8deea] transition hover:border-[#3c4b68] hover:text-white disabled:opacity-40"
                     >
                       {testingProvider === p.id && (
                         <Loader2 className="h-3 w-3 animate-spin text-[#8ed90b]" />
                       )}
-                      <span>Test</span>
+                      <span>Test Endpoint</span>
                     </button>
+
                     {p.configured && !p.active && (
                       <button
                         type="button"
                         disabled={switchingProvider === p.id}
                         onClick={() => void handleSelectProvider(p.id)}
-                        className="flex flex-1 items-center justify-center rounded-lg bg-[#76b900] py-1.5 text-[11px] font-semibold text-[#080d03] hover:bg-[#8ed90b] disabled:opacity-50"
+                        className="rounded-lg bg-[#76b900] px-2.5 py-1.5 text-[11px] font-semibold text-[#080d03] transition hover:bg-[#8ed90b] disabled:opacity-50"
                       >
                         Activate
                       </button>
@@ -320,105 +472,42 @@ export function SettingsView({
               );
             })}
           </div>
-
-          {/* Copyable .env template */}
-          <div className="mt-4 rounded-xl border border-[#1d2536] bg-[#090c12] p-3.5">
-            <div className="flex items-center justify-between">
-              <span className="text-[11px] font-semibold text-[#cfd6e4]">
-                Server Environment Quick Setup (.env)
-              </span>
-              <button
-                type="button"
-                onClick={() => void handleCopyEnv()}
-                className="flex items-center gap-1 rounded-md border border-[#263044] px-2 py-1 text-[10px] font-medium text-[#aeb7c9] hover:text-white"
-              >
-                {copied ? (
-                  <Check className="h-3 w-3 text-[#8ed90b]" />
-                ) : (
-                  <Copy className="h-3 w-3" />
-                )}
-                <span>{copied ? 'Copied' : 'Copy'}</span>
-              </button>
-            </div>
-            <pre className="mt-2 overflow-x-auto font-mono-tech text-[10px] leading-relaxed text-[#8d97ab]">
-              {ENV_SNIPPET}
-            </pre>
-          </div>
         </section>
 
-        {/* 3. Database, Credits & Security */}
-        <div className="grid gap-4 md:grid-cols-2">
-          <section className="rounded-2xl border border-[#1f2737] bg-[#111520] p-5">
+        {/* 4. Storage & Privacy Controls */}
+        <section className="grid gap-4 md:grid-cols-2">
+          <div className="rounded-2xl border border-[#1f2737] bg-[#111520] p-5">
             <div className="flex items-center gap-2">
               <Database className="h-4 w-4 text-[#8ed90b]" />
-              <h2 className="text-sm font-semibold text-white">PostgreSQL / Supabase Schema</h2>
+              <h2 className="text-sm font-semibold text-white">Zero-Config Storage Runtime</h2>
             </div>
-            <p className="mt-1 font-mono-tech text-[11px] text-[#9aa4b8]">
-              Engine: {systemStatus?.database.engine ?? 'postgresql'}
+            <p className="mt-1.5 text-xs text-[#8d97ab]">
+              Engine:{' '}
+              <span className="font-mono-tech text-white">
+                {systemStatus?.database.engine === 'postgresql'
+                  ? 'PostgreSQL / Supabase'
+                  : 'Embedded PostgreSQL 16 (No DATABASE_URL needed)'}
+              </span>
             </p>
-            <div className="mt-3 flex flex-wrap gap-1.5">
-              {(systemStatus?.database.tables ?? []).map((tbl) => (
-                <span
-                  key={tbl}
-                  className="rounded-md border border-[#242e42] bg-[#0c1017] px-2 py-1 font-mono-tech text-[10px] text-[#a3e635]"
-                >
-                  {tbl}
-                </span>
-              ))}
-            </div>
-            {credits && (
-              <div className="mt-4 border-t border-[#1d2536] pt-3 text-xs">
-                <div className="flex justify-between">
-                  <span className="text-[#838ea4]">Credit Balance</span>
-                  <span className="font-mono-tech font-semibold text-white">
-                    {credits.balance} CR
-                  </span>
-                </div>
-                <div className="mt-1 flex justify-between text-[11px]">
-                  <span className="text-[#6d788e]">Lifetime Granted / Spent</span>
-                  <span className="font-mono-tech text-[#9aa4b8]">
-                    {credits.lifetimeGranted} / {credits.lifetimeSpent} CR
-                  </span>
-                </div>
-              </div>
-            )}
-          </section>
+            <p className="mt-1 text-[11px] text-[#7e899f]">
+              Max upload: {systemStatus?.limits.maxUploadMb ?? 15} MB · Max GLB import:{' '}
+              {systemStatus?.limits.maxGlbImportMb ?? 50} MB
+            </p>
+          </div>
 
-          <section className="rounded-2xl border border-[#1f2737] bg-[#111520] p-5">
+          <div className="rounded-2xl border border-[#1f2737] bg-[#111520] p-5">
             <div className="flex items-center gap-2">
               <ShieldCheck className="h-4 w-4 text-[#8ed90b]" />
-              <h2 className="text-sm font-semibold text-white">Active Security Controls</h2>
+              <h2 className="text-sm font-semibold text-white">Key Privacy & Asset Safety</h2>
             </div>
-            <ul className="mt-3 space-y-2 text-xs text-[#aeb7c9]">
-              <li className="flex items-center gap-2">
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[#8ed90b]" />
-                <span>Server-side API credentials (zero secrets in browser bundle)</span>
-              </li>
-              <li className="flex items-center gap-2">
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[#8ed90b]" />
-                <span>
-                  Magic-byte PNG/JPG/WEBP validation + EXIF strip (max{' '}
-                  {systemStatus?.limits.maxUploadMb ?? 15} MB)
-                </span>
-              </li>
-              <li className="flex items-center gap-2">
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[#8ed90b]" />
-                <span>Per-user isolated storage & model/upload ownership checks</span>
-              </li>
-              <li className="flex items-center gap-2">
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[#8ed90b]" />
-                <span>
-                  Rate limiting ({systemStatus?.limits.generationRateLimitPerMin ?? 12} gen/min) &
-                  HMAC-SHA256 webhook verification
-                </span>
-              </li>
-              <li className="flex items-center gap-2">
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[#8ed90b]" />
-                <span>Strict CSP, XSS input sanitization, and weapons-free policy</span>
-              </li>
+            <ul className="mt-2 space-y-1 text-xs text-[#b9c3d6]">
+              <li>• No sign-up, email, or password required</li>
+              <li>• API key lives only in your browser localStorage (never stored in DB or logs)</li>
+              <li>• Khronos glTF 2.0 binary validation before every GLB/GLTF export</li>
+              <li>• Strictly weapons-free asset generation policy</li>
             </ul>
-          </section>
-        </div>
+          </div>
+        </section>
       </div>
     </div>
   );

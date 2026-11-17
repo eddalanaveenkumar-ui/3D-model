@@ -76,6 +76,21 @@ export async function ensureStudioUser(
       return;
     }
 
+    // Check browser workspace session header (X-NV3D-Session): if expired/rotated on serverless,
+    // transparently re-issue a fresh zero-login workspace session without interrupting uploads.
+    const sessionHeader = req.header('x-nv3d-session')?.trim();
+    if (sessionHeader) {
+      const userId = verifyAuthToken(sessionHeader);
+      if (userId) {
+        const profile = await getUserProfile(userId);
+        if (profile) {
+          req.user = profile;
+          next();
+          return;
+        }
+      }
+    }
+
     const cookieToken = req.cookies?.[AUTH_COOKIE_NAME];
     if (typeof cookieToken === 'string' && cookieToken.length > 0) {
       const userId = verifyAuthToken(cookieToken);

@@ -1,65 +1,14 @@
 import { Router } from 'express';
-import { z } from 'zod';
-import {
-  clearSessionCookie,
-  ensureStudioUser,
-  resolveOptionalUserId,
-  setSessionCookie,
-} from '../middleware/auth.js';
-import { createAuthRateLimiter } from '../middleware/rateLimit.js';
-import {
-  getUserCredits,
-  loginUser,
-  registerUser,
-} from '../services/authService.js';
+import { clearSessionCookie, ensureStudioUser } from '../middleware/auth.js';
+import { getUserCredits } from '../services/authService.js';
 
-const RegisterSchema = z.object({
-  email: z.string().email().max(180),
-  password: z.string().min(8).max(128),
-  displayName: z.string().min(2).max(80),
-});
-
-const LoginSchema = z.object({
-  email: z.string().email().max(180),
-  password: z.string().min(1).max(128),
-});
-
+/**
+ * Zero-login workspace session router.
+ * Sign-up and password login are intentionally disabled: every browser automatically
+ * receives an isolated anonymous studio session with no account creation required.
+ */
 export function createAuthRouter(): Router {
   const router = Router();
-  const authLimiter = createAuthRateLimiter();
-
-  router.post('/register', authLimiter, async (req, res, next) => {
-    try {
-      const body = RegisterSchema.parse(req.body);
-      const currentUserId = await resolveOptionalUserId(req);
-      const { user, token } = await registerUser({
-        email: body.email,
-        password: body.password,
-        displayName: body.displayName,
-        upgradeGuestUserId: currentUserId,
-      });
-      setSessionCookie(res, token);
-      res.status(201).json({ user, token });
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  router.post('/login', authLimiter, async (req, res, next) => {
-    try {
-      const body = LoginSchema.parse(req.body);
-      const { user, token } = await loginUser(body.email, body.password);
-      setSessionCookie(res, token);
-      res.json({ user, token });
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  router.post('/logout', (_req, res) => {
-    clearSessionCookie(res);
-    res.json({ loggedOut: true });
-  });
 
   router.get('/me', ensureStudioUser, (req, res) => {
     res.json({ user: req.user });
@@ -72,6 +21,11 @@ export function createAuthRouter(): Router {
     } catch (err) {
       next(err);
     }
+  });
+
+  router.post('/reset-session', (_req, res) => {
+    clearSessionCookie(res);
+    res.json({ reset: true });
   });
 
   return router;

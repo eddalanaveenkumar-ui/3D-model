@@ -15,6 +15,12 @@ import type {
   SystemStatus,
   UserProfile,
 } from '@nv3d/shared';
+import {
+  DEFAULT_NIM_3D_ENDPOINT,
+  DEFAULT_NIM_MODEL_ID,
+  getStoredNimSettings,
+  getStoredNvidiaApiKey,
+} from './nimKeyStore';
 
 export class ApiClientError extends Error {
   constructor(
@@ -28,13 +34,13 @@ export class ApiClientError extends Error {
   }
 }
 
-const SESSION_TOKEN_KEY = 'nv3d_studio_session_token';
+const SESSION_TOKEN_KEY = 'nv3d_workspace_session_token';
 let memorySessionToken: string | null = null;
 
 function getStoredSessionToken(): string | null {
   if (memorySessionToken) return memorySessionToken;
   try {
-    memorySessionToken = window.sessionStorage.getItem(SESSION_TOKEN_KEY);
+    memorySessionToken = window.localStorage.getItem(SESSION_TOKEN_KEY);
     return memorySessionToken;
   } catch {
     return null;
@@ -44,8 +50,8 @@ function getStoredSessionToken(): string | null {
 export function setStoredSessionToken(token: string | null): void {
   memorySessionToken = token;
   try {
-    if (token) window.sessionStorage.setItem(SESSION_TOKEN_KEY, token);
-    else window.sessionStorage.removeItem(SESSION_TOKEN_KEY);
+    if (token) window.localStorage.setItem(SESSION_TOKEN_KEY, token);
+    else window.localStorage.removeItem(SESSION_TOKEN_KEY);
   } catch {
     // Ignore restricted storage contexts; in-memory token remains active
   }
@@ -53,14 +59,35 @@ export function setStoredSessionToken(token: string | null): void {
 
 export function attachAuthHeaders(headers: Headers): Headers {
   const tok = getStoredSessionToken();
-  if (tok && !headers.has('Authorization')) {
-    headers.set('Authorization', `Bearer ${tok}`);
+  if (tok && !headers.has('X-NV3D-Session')) {
+    headers.set('X-NV3D-Session', tok);
+  }
+  return headers;
+}
+
+function attachNimHeaders(url: string, headers: Headers): Headers {
+  if (
+    url.startsWith('/api/system') ||
+    url.startsWith('/api/ai') ||
+    url.startsWith('/api/generate')
+  ) {
+    const nimKey = getStoredNvidiaApiKey();
+    if (nimKey && !headers.has('X-Nvidia-Api-Key')) {
+      headers.set('X-Nvidia-Api-Key', nimKey);
+    }
+    const settings = getStoredNimSettings();
+    if (settings.modelId && settings.modelId !== DEFAULT_NIM_MODEL_ID) {
+      headers.set('X-Nvidia-Nim-Model', settings.modelId);
+    }
+    if (settings.nim3dEndpoint && settings.nim3dEndpoint !== DEFAULT_NIM_3D_ENDPOINT) {
+      headers.set('X-Nvidia-3d-Endpoint', settings.nim3dEndpoint);
+    }
   }
   return headers;
 }
 
 async function requestJson<T>(url: string, init: RequestInit = {}, retried = false): Promise<T> {
-  const headers = attachAuthHeaders(new Headers(init.headers));
+  const headers = attachNimHeaders(url, attachAuthHeaders(new Headers(init.headers)));
   if (init.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
@@ -77,8 +104,8 @@ async function requestJson<T>(url: string, init: RequestInit = {}, retried = fal
     setStoredSessionToken(issuedSession);
   }
 
-  // If a cached session token expired (e.g. server restart in dev), clear and retry once cleanly
-  if (res.status === 401 && !retried && getStoredSessionToken() && !url.startsWith('/api/auth/login')) {
+  // If a cached zero-login workspace session expired, clear and retry once seamlessly
+  if (res.status === 401 && !retried && getStoredSessionToken()) {
     setStoredSessionToken(null);
     return requestJson<T>(url, init, true);
   }
@@ -228,30 +255,9 @@ export const api = {
       body: JSON.stringify({ providerId }),
     }),
 
-  // Authentication & Credits
+  // Zero-Login Anonymous Workspace Session
   getMe: () => requestJson<{ user: UserProfile }>('/api/auth/me'),
   getCredits: () => requestJson<{ credits: CreditLedgerEntry }>('/api/auth/credits'),
-  register: async (payload: { email: string; password: string; displayName: string }) => {
-    const out = await requestJson<{ user: UserProfile; token: string }>('/api/auth/register', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-    setStoredSessionToken(out.token);
-    return out;
-  },
-  login: async (payload: { email: string; password: string }) => {
-    const out = await requestJson<{ user: UserProfile; token: string }>('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-    setStoredSessionToken(out.token);
-    return out;
-  },
-  logout: async () => {
-    const out = await requestJson<{ loggedOut: boolean }>('/api/auth/logout', { method: 'POST' });
-    setStoredSessionToken(null);
-    return out;
-  },
 
   // Text-to-3D & Image-to-3D Generation
   generateFromText: (prompt: string, settings: GenerationSettings) =>

@@ -6,10 +6,9 @@ import dotenv from 'dotenv';
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 dotenv.config({ path: path.resolve(process.cwd(), '../.env') });
 
-// Ephemeral per-process fallback secret when JWT_SECRET is omitted in dev or initial zero-env preview.
-// Never hardcoded — generated from CSPRNG at startup.
-const ephemeralDevJwtSecret = crypto.randomBytes(48).toString('hex');
-let loggedVercelJwtWarning = false;
+// Ephemeral per-process CSPRNG signing key for zero-login workspace sessions when JWT_SECRET is omitted.
+// Never hardcoded — generated freshly from crypto.randomBytes at startup.
+const ephemeralSessionSecret = crypto.randomBytes(48).toString('hex');
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (!raw) return fallback;
@@ -55,6 +54,8 @@ export interface AppConfig {
     endpoint: string;
     model: string;
     visionModel: string;
+    nim3dEndpoint: string;
+    nim3dEnabled: boolean;
     apiKey: string;
     timeoutMs: number;
   };
@@ -89,19 +90,6 @@ export function getConfig(): AppConfig {
   const isVercel = Boolean(process.env.VERCEL);
 
   const configuredJwt = (process.env.JWT_SECRET || '').trim();
-  if (isProduction && configuredJwt.length < 32) {
-    if (!isVercel) {
-      throw new Error(
-        'SECURITY ERROR: JWT_SECRET environment variable must be set to at least 32 characters in production.'
-      );
-    }
-    if (!loggedVercelJwtWarning) {
-      loggedVercelJwtWarning = true;
-      console.warn(
-        '[NV3D Studio] WARNING: JWT_SECRET is missing or <32 chars on Vercel. Using ephemeral runtime secret; configure JWT_SECRET in Vercel Project Settings for persistent multi-instance sessions.'
-      );
-    }
-  }
 
   const repoRoot = path.basename(process.cwd()) === 'backend'
     ? path.resolve(process.cwd(), '..')
@@ -135,7 +123,7 @@ export function getConfig(): AppConfig {
     port: parsePositiveInt(process.env.PORT, 3001),
     host: (process.env.HOST || '0.0.0.0').trim(),
     corsOrigins,
-    jwtSecret: configuredJwt.length >= 32 ? configuredJwt : configuredJwt || ephemeralDevJwtSecret,
+    jwtSecret: configuredJwt.length >= 32 ? configuredJwt : ephemeralSessionSecret,
     jwtExpiresInDays: parsePositiveInt(process.env.JWT_EXPIRES_IN_DAYS, 7),
     initialUserCredits: parsePositiveInt(process.env.INITIAL_USER_CREDITS, 250),
     databaseUrl: (process.env.DATABASE_URL || '').trim(),
@@ -163,6 +151,12 @@ export function getConfig(): AppConfig {
         process.env.NVIDIA_NIM_MODEL ||
         'minimaxai/minimax-m3.1-flash'
       ).trim(),
+      nim3dEndpoint: (
+        process.env.NVIDIA_NIM_3D_ENDPOINT || 'https://ai.api.nvidia.com/v1/genai/microsoft/trellis'
+      )
+        .trim()
+        .replace(/\/+$/, ''),
+      nim3dEnabled: parseBoolean(process.env.NVIDIA_NIM_3D_ENABLED, true),
       apiKey: (process.env.NVIDIA_NIM_API_KEY || '').trim(),
       timeoutMs: parsePositiveInt(process.env.NVIDIA_NIM_TIMEOUT_MS, 30_000),
     },

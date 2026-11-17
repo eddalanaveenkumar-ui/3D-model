@@ -147,7 +147,7 @@ export function AiAssistantPanel({
           <p className="mt-1 font-mono-tech text-[10px] text-[#78839a]">{modelId}</p>
           <p className="mt-1.5 text-[11px] leading-relaxed text-[#9aa4b8]">
             Orchestrates prompt enhancement, multimodal reference analysis, structured JSON specs,
-            and workflow diagnostics via server-side NVIDIA NIM API.
+            and workflow diagnostics using your NVIDIA NIM API key.
           </p>
           {!nimConfigured && (
             <button
@@ -156,7 +156,7 @@ export function AiAssistantPanel({
               className="mt-2 flex items-center gap-1 text-[11px] font-medium text-amber-300 hover:underline"
             >
               <Settings className="h-3 w-3" />
-              <span>Set NVIDIA_NIM_API_KEY in server .env</span>
+              <span>Paste NVIDIA NIM API Key (saved in localStorage)</span>
             </button>
           )}
         </div>
