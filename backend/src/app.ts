@@ -91,19 +91,21 @@ export function createApp(): Express {
     });
   });
 
-  // Serve built frontend bundle when available (production unified server)
-  const currentDir = path.dirname(fileURLToPath(import.meta.url));
-  const frontendDist = path.resolve(currentDir, '../../frontend/dist');
-  if (fs.existsSync(path.join(frontendDist, 'index.html'))) {
-    app.use(
-      express.static(frontendDist, {
-        index: false,
-        maxAge: '1h',
-      })
-    );
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(frontendDist, 'index.html'));
-    });
+  // Serve built frontend bundle on standalone Node deployments (Vercel serves frontend/dist via CDN)
+  if (!config.isVercel) {
+    const currentDir = path.dirname(fileURLToPath(import.meta.url));
+    const frontendDist = path.resolve(currentDir, '../../frontend/dist');
+    if (fs.existsSync(path.join(frontendDist, 'index.html'))) {
+      app.use(
+        express.static(frontendDist, {
+          index: false,
+          maxAge: '1h',
+        })
+      );
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(frontendDist, 'index.html'));
+      });
+    }
   }
 
   app.use(errorHandler);
