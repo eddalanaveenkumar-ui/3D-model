@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Environment secrets (never commit real secrets)
+.env
+.env.local
+.env.*.local
+
+# Runtime database & user-uploaded/generated storage
+.data/
+backend/.data/
+storage/
+backend/storage/
+
+# Test & coverage artifacts
+coverage/
+.vitest/
+test-results/
+playwright-report/
+tmp/
+
+# OS / Editor
+.DS_Store
+*.log
